@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local secrets & data (never commit)
+config.json
+*.db
+*.db-wal
+*.db-shm
+.pdfspecs/
+
+# Ingested source documents
+ingestion_files/
+
+# Scratch / experiments
+scratch_*.py
+
+# OS
+.DS_Store
