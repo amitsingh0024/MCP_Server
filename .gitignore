@@ -7,6 +7,8 @@ venv/
 
 # Local secrets & data (never commit)
 config.json
+.env
+.env.local
 *.db
 *.db-wal
 *.db-shm
