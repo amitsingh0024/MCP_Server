@@ -69,9 +69,17 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       *Verified* on a local Postgres 16-equivalent (pgvector bits shimmed): both migrations
       apply; generated tsvector matches; per-org sha256 uniqueness; cross-org entity FK
       blocked; cascade delete isolates tenants; RLS enabled on all 10 tenant tables.
-- [ ] **M2 — Data layer rewrite.** Replace SQLite `db.py` with Postgres (SQLAlchemy or
-      psycopg). Every query takes/filters `org_id`. Swap FTS5→`tsvector`, in-memory NumPy
-      cosine→pgvector `<=>` nearest-neighbor. This is the biggest chunk of work.
+- [~] **M2 — Data layer rewrite.** New Postgres layer `src/pgdb.py` (psycopg3 pool +
+      pgvector): every function org-scoped; lexical search via `websearch_to_tsquery`
+      (accepts arbitrary input — no sanitizer needed); semantic search via pgvector `<=>`
+      in-DB against the HNSW index (no more loading all embeddings into Python); queue
+      dequeue via `FOR UPDATE SKIP LOCKED`; encrypted per-org settings; hashed API keys →
+      org_id; per-org metrics. Deps added (`psycopg[binary]`, `psycopg-pool`, `pgvector`).
+      *Verified* against local Postgres (pgvector shimmed): all functions pass incl.
+      cross-org isolation for docs/chunks/lexical/entities/settings/keys/metrics.
+      *Deferred to live Supabase:* `search_semantic` (`<=>`) needs the real pgvector ext.
+      *Not yet wired:* callsites (queue/mcp/server/cli) still use the old SQLite `src/db.py`;
+      they move onto `pgdb` in M5/M6 once orgs exist (needs the M3 auth/org bootstrap first).
 - [ ] **M3 — Admin auth.** Supabase Google login on the frontend; backend verifies the
       Supabase JWT on dashboard endpoints; on first login create the org row (bootstrap);
       org-scoped API-key issuance with **hashed** storage (folds in FIXPLAN 2.2/2.3).
