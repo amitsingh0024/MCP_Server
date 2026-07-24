@@ -5,50 +5,11 @@ import pytesseract
 from PIL import Image
 from src.config import get_config
 
-def extract_page_text_and_tables(page, enable_ocr: bool = False) -> str:
-    """
-    Extracts text from a page while detecting tables.
-    Discards raw text inside table boundaries and appends the tables
-    formatted as Markdown to avoid double/scrambled text.
-    If enable_ocr is True, parses the whole page image using Tesseract 
-    (with Hindi/Sanskrit/English support) instead of extracting raw vector text.
-    """
-    try:
-        tables = page.find_tables()
-    except Exception:
-        tables = None
-
-    if enable_ocr:
-        try:
-            pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            # Use English, Hindi, and Sanskrit language packs
-            ocr_text = pytesseract.image_to_string(img, lang='eng+hin+san')
-            page_text = ocr_text.strip()
-            
-            # If we found tables, append them as markdown as a structured fallback
-            if tables and tables.tables:
-                table_markdowns = []
-                for table in tables:
-                    try:
-                        md = table.to_markdown()
-                        if md:
-                            table_markdowns.append(md)
-                    except Exception:
-                        pass
-                if table_markdowns:
-                    page_text += "\n\n### [Structured Table Data]\n" + "\n\n".join(table_markdowns)
-            
-            return page_text
-        except Exception as e:
-            # Fallback to standard extraction if OCR fails
-            pass
-
-    if not tables or not tables.tables:
-        return page.get_text("text").strip()
-
-    # Convert tables to markdown
+def _tables_to_markdown(tables) -> list:
+    """Renders detected tables to Markdown, skipping any that fail to convert."""
     table_markdowns = []
+    if not tables or not tables.tables:
+        return table_markdowns
     for table in tables:
         try:
             md = table.to_markdown()
@@ -56,15 +17,50 @@ def extract_page_text_and_tables(page, enable_ocr: bool = False) -> str:
                 table_markdowns.append(md)
         except Exception:
             pass
+    return table_markdowns
+
+
+def _ocr_page(page, tables) -> str:
+    """
+    Rasterizes the page and runs Tesseract (English/Hindi/Sanskrit), appending any
+    detected tables as Markdown. Returns the OCR text, or None if OCR fails or is empty
+    (so the caller can fall back to text-layer extraction).
+    """
+    try:
+        pix = page.get_pixmap(dpi=300)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        ocr_text = pytesseract.image_to_string(img, lang='eng+hin+san').strip()
+    except Exception:
+        return None
+
+    if not ocr_text:
+        return None
+
+    table_markdowns = _tables_to_markdown(tables)
+    if table_markdowns:
+        ocr_text += "\n\n### [Structured Table Data]\n" + "\n\n".join(table_markdowns)
+    return ocr_text
+
+
+def _extract_text_layer(page, tables) -> str:
+    """
+    Extracts the vector text layer, discarding raw text inside detected table
+    boundaries and appending those tables as clean Markdown instead (avoids
+    double/scrambled text).
+    """
+    if not tables or not tables.tables:
+        return page.get_text("text").strip()
+
+    table_markdowns = _tables_to_markdown(tables)
 
     # Get all text blocks
     # block shape: (x0, y0, x1, y1, "text", block_no, block_type)
     blocks = page.get_text("blocks")
-    
+
     filtered_blocks = []
     for b in blocks:
         x0, y0, x1, y1, text, block_no, block_type = b
-        
+
         # Check if block overlaps significantly with any table bounding box
         is_inside_table = False
         for tab in tables:
@@ -74,7 +70,7 @@ def extract_page_text_and_tables(page, enable_ocr: bool = False) -> str:
             if x0 >= (tx0 - 2) and x1 <= (tx1 + 2) and y0 >= (ty0 - 2) and y1 <= (ty1 + 2):
                 is_inside_table = True
                 break
-        
+
         if not is_inside_table and text.strip():
             filtered_blocks.append(b)
 
@@ -90,6 +86,37 @@ def extract_page_text_and_tables(page, enable_ocr: bool = False) -> str:
         page_text += "\n\n### [Structured Table Data]\n" + "\n\n".join(table_markdowns)
 
     return page_text.strip()
+
+
+def extract_page_text_and_tables(page, ocr_mode: str = "auto", ocr_min_chars: int = 40) -> str:
+    """
+    Extracts text from a page while detecting tables, honoring the OCR policy:
+      - "never":  always use the vector text layer, never OCR.
+      - "always": OCR the page image (falling back to the text layer if OCR fails).
+      - "auto":   OCR only when the text layer is thinner than `ocr_min_chars`
+                  (i.e. a likely-scanned page), otherwise use the text layer.
+    """
+    try:
+        tables = page.find_tables()
+    except Exception:
+        tables = None
+
+    # Decide whether to OCR this page.
+    if ocr_mode == "always":
+        do_ocr = True
+    elif ocr_mode == "auto":
+        # Cheap probe of the raw text layer to detect scanned/image-only pages.
+        do_ocr = len(page.get_text("text").strip()) < ocr_min_chars
+    else:  # "never"
+        do_ocr = False
+
+    if do_ocr:
+        ocr_text = _ocr_page(page, tables)
+        if ocr_text is not None:
+            return ocr_text
+        # OCR failed or produced nothing -> fall back to text-layer extraction.
+
+    return _extract_text_layer(page, tables)
 
 def parse_pdf(file_path: Path, progress_callback=None) -> dict:
     """
@@ -118,13 +145,14 @@ def parse_pdf(file_path: Path, progress_callback=None) -> dict:
     pages = []
     
     config = get_config()
-    enable_ocr = getattr(config, 'enable_ocr', True)
-    
+    ocr_mode = getattr(config, "ocr_mode", "auto")
+    ocr_min_chars = getattr(config, "ocr_min_chars", 40)
+
     for page_num in range(len(doc)):
         if progress_callback:
             progress_callback(page_num + 1, len(doc))
         page = doc.load_page(page_num)
-        text = extract_page_text_and_tables(page, enable_ocr=enable_ocr)
+        text = extract_page_text_and_tables(page, ocr_mode=ocr_mode, ocr_min_chars=ocr_min_chars)
         pages.append({
             "page_num": page_num + 1,
             "text": text

@@ -19,14 +19,16 @@ Legend: 🔴 bug · 🟠 security · 🟡 dead config · 🟢 perf/arch · ⚪ c
 
 ## Phase 1 — Correctness bugs (highest impact)
 
-- [ ] **1.1 🔴 Fix OCR wiring** — `src/parser.py:121`
-      - Replace `getattr(config, 'enable_ocr', True)` with real use of `config.ocr_mode`
-        (`auto`|`always`|`never`) and `config.ocr_min_chars`.
-      - Per page: extract the text layer first. OCR only when `mode == always`, or
-        `mode == auto` and `len(text_layer) < ocr_min_chars`. Never OCR when `mode == never`.
-      - Pass `ocr_mode`/`ocr_min_chars` down from `parse_pdf` into `extract_page_text_and_tables`.
-      *Verify:* ingest one text PDF (should NOT OCR — fast) and one scanned/low-text PDF
-      (should OCR). Confirm timing difference + logs.
+- [x] **1.1 🔴 Fix OCR wiring** — `src/parser.py` — done.
+      - Replaced buggy `getattr(config, 'enable_ocr', True)` with real use of
+        `config.ocr_mode` (`auto`|`always`|`never`) + `config.ocr_min_chars`.
+      - Split extraction into `_ocr_page` / `_extract_text_layer` / `_tables_to_markdown`
+        helpers; `extract_page_text_and_tables` now decides per page (auto probes the
+        text-layer length cheaply before OCR'ing). OCR falls back to the text layer on
+        failure/empty.
+      *Verified:* on a text page — `auto` skips OCR (~60ms, identical to `never`) vs the
+      old always-on path (~2860ms); forcing the auto threshold high triggers a real OCR
+      pass. All 10 tests pass.
 
 - [ ] **1.2 🔴 Embedding dimension/model tracking** — `src/db.py`, `src/mcp_server.py`, `src/cli.py`
       - Add `embedding_model TEXT` and/or `embedding_dim INTEGER` column to `chunks`
