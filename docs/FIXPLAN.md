@@ -41,11 +41,15 @@ Legend: 🔴 bug · 🟠 security · 🟡 dead config · 🟢 perf/arch · ⚪ c
       matrix (no ragged-array crash), warning fired; legacy DB (no column) auto-migrates;
       all 10 tests pass.
 
-- [ ] **1.3 🔴 Harden FTS `MATCH`** — `src/db.py:242`
-      - Sanitize/quote the user query before `chunks_fts MATCH ?` (e.g. wrap tokens in
-        double quotes) so FTS5 operators/punctuation don't error out into the LIKE fallback.
-      *Verify:* search for a query containing `"`, `:`, `-`, `AND` — no OperationalError,
-      results still returned.
+- [x] **1.3 🔴 Harden FTS `MATCH`** — `src/db.py` — done.
+      - Added `_sanitize_fts_query`: wraps each whitespace token as a quoted FTS5 string
+        (doubling embedded quotes), so `-`, `:`, `*`, `^`, `AND/OR/NOT`, stray quotes are
+        literal terms (implicitly AND-ed) instead of syntax errors. Empty/punctuation-only
+        queries and a still-rejected MATCH both fall back to a `_like_fallback` LIKE scan.
+      *Verified:* `fever AND cough`, `dosha:balance`, `-herbs`, `caching "strategy"`, `::`
+      all return cleanly with no OperationalError; all 10 tests pass.
+      *Note:* boolean words (AND/OR) are now treated literally by design — safer/predictable;
+      normal multi-word queries were already AND-ed by FTS5, so they're unchanged.
 
 - [ ] **1.4 🔴 Fix FTS dedupe on re-insert** — `src/db.py:187`
       - `chunks_fts` has no unique key, so `INSERT OR REPLACE` duplicates rows. Either

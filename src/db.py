@@ -276,8 +276,37 @@ def add_keyword(chunk_id, keyword):
             (chunk_id, keyword)
         )
 
+def _sanitize_fts_query(query_text: str) -> str:
+    """
+    Turns a raw user query into a safe FTS5 MATCH expression.
+
+    Each whitespace-separated token is wrapped as a quoted FTS5 string (embedded
+    double quotes doubled per FTS5 escaping rules), so operators and punctuation
+    (-, :, *, ^, AND/OR/NOT, stray quotes) are treated as literal search terms
+    instead of raising a syntax error. Tokens are implicitly AND-ed.
+    Returns "" when the query has no usable tokens.
+    """
+    tokens = query_text.split()
+    quoted = [f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens if tok]
+    return " ".join(quoted)
+
+def _like_fallback(conn, query_text, limit):
+    search_pattern = f"%{query_text}%"
+    rows = conn.execute("""
+        SELECT id as chunk_id, 1.0 as rank, substr(text_content, 1, 200) as match_summary
+        FROM chunks
+        WHERE text_content LIKE ? OR summary LIKE ?
+        LIMIT ?
+    """, (search_pattern, search_pattern, limit)).fetchall()
+    return [dict(r) for r in rows]
+
 def query_lexical_fts(query_text, limit=20):
+    match_query = _sanitize_fts_query(query_text)
     with get_connection() as conn:
+        # An empty match_query (query was only punctuation/whitespace) can't be a
+        # valid MATCH expression; fall back to a literal LIKE scan.
+        if not match_query:
+            return _like_fallback(conn, query_text, limit)
         try:
             rows = conn.execute("""
                 SELECT chunk_id, rank, snippet(chunks_fts, 1, '<b>', '</b>', '...', 64) as match_summary
@@ -285,17 +314,12 @@ def query_lexical_fts(query_text, limit=20):
                 WHERE chunks_fts MATCH ?
                 ORDER BY rank
                 LIMIT ?
-            """, (query_text, limit)).fetchall()
+            """, (match_query, limit)).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
-            search_pattern = f"%{query_text}%"
-            rows = conn.execute("""
-                SELECT id as chunk_id, 1.0 as rank, substr(text_content, 1, 200) as match_summary
-                FROM chunks
-                WHERE text_content LIKE ? OR summary LIKE ?
-                LIMIT ?
-            """, (search_pattern, search_pattern, limit)).fetchall()
-            return [dict(r) for r in rows]
+            # Safety net: if the FTS table is missing or the expression is still
+            # rejected, degrade to a LIKE scan rather than failing the search.
+            return _like_fallback(conn, query_text, limit)
 
 # CRUD operations for Settings (Encrypted)
 def save_setting(key: str, value: str, encrypt: bool = False):
