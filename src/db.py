@@ -200,8 +200,12 @@ def add_chunk(chunk_id, document_id, page_start, page_end, text_content, summary
             (chunk_id, document_id, page_start, page_end, text_content, summary, embedding_blob, embedding_model)
         )
         try:
+            # chunks_fts has no UNIQUE key on chunk_id, so INSERT OR REPLACE can't
+            # replace an existing row and would append a duplicate. Delete first to
+            # keep re-inserting the same chunk_id idempotent.
+            conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
             conn.execute(
-                "INSERT OR REPLACE INTO chunks_fts (chunk_id, text_content, summary) VALUES (?, ?, ?)",
+                "INSERT INTO chunks_fts (chunk_id, text_content, summary) VALUES (?, ?, ?)",
                 (chunk_id, text_content, summary)
             )
         except sqlite3.OperationalError:

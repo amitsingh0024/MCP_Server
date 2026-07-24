@@ -51,11 +51,12 @@ Legend: 🔴 bug · 🟠 security · 🟡 dead config · 🟢 perf/arch · ⚪ c
       *Note:* boolean words (AND/OR) are now treated literally by design — safer/predictable;
       normal multi-word queries were already AND-ed by FTS5, so they're unchanged.
 
-- [ ] **1.4 🔴 Fix FTS dedupe on re-insert** — `src/db.py:187`
-      - `chunks_fts` has no unique key, so `INSERT OR REPLACE` duplicates rows. Either
-        `DELETE FROM chunks_fts WHERE chunk_id = ?` before insert, or switch to an
-        external-content FTS table keyed to `chunks`.
-      *Verify:* insert same chunk_id twice → exactly one FTS row.
+- [x] **1.4 🔴 Fix FTS dedupe on re-insert** — `src/db.py` — done.
+      - `add_chunk` now `DELETE FROM chunks_fts WHERE chunk_id = ?` before a plain
+        `INSERT` (INSERT OR REPLACE couldn't dedupe without a UNIQUE key), making
+        re-insert idempotent.
+      *Verified:* inserting the same chunk_id twice leaves exactly one FTS row reflecting
+      the latest content; a single search hit; all 10 tests pass.
 
 ---
 
