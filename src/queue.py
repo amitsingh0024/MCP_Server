@@ -188,7 +188,8 @@ def process_single_task(task: dict) -> bool:
                 page_end=page_end,
                 text_content=text_content,
                 summary=analysis["summary"],
-                embedding=analysis["embedding"]
+                embedding=analysis["embedding"],
+                embedding_model=analysis.get("embedding_model")
             )
             
             # Store keywords

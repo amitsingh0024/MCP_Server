@@ -30,15 +30,16 @@ Legend: 🔴 bug · 🟠 security · 🟡 dead config · 🟢 perf/arch · ⚪ c
       old always-on path (~2860ms); forcing the auto threshold high triggers a real OCR
       pass. All 10 tests pass.
 
-- [ ] **1.2 🔴 Embedding dimension/model tracking** — `src/db.py`, `src/mcp_server.py`, `src/cli.py`
-      - Add `embedding_model TEXT` and/or `embedding_dim INTEGER` column to `chunks`
-        (with auto-migration `ALTER TABLE` like the existing `progress_info` pattern).
-      - Store the model used when writing a chunk (`add_chunk`).
-      - In `get_all_chunks_with_embeddings`, filter to rows matching the *current* query
-        provider's dimension so a provider switch can't create a ragged matrix.
-      - Optionally surface a clear warning when chunks exist under a different model.
-      *Verify:* ingest under gemini, switch provider to nvidia, run a search — semantic
-      search should degrade gracefully (skip mismatched vectors), not throw silently.
+- [x] **1.2 🔴 Embedding dimension/model tracking** — done.
+      - Added `embedding_model TEXT` column to `chunks` (in CREATE + `ALTER TABLE`
+        auto-migration for existing DBs).
+      - `enrich_chunk` now returns `embedding_model`; `queue`→`add_chunk` persists it.
+      - `get_all_chunks_with_embeddings(expected_dim=...)` filters to the query vector's
+        dimension and logs a warning naming how many chunks were excluded. Both search
+        call sites (`mcp_server`, `cli`) pass `expected_dim=len(q_vec)`.
+      *Verified:* mixed 768-d/1024-d corpus → only matching dim returned, rectangular
+      matrix (no ragged-array crash), warning fired; legacy DB (no column) auto-migrates;
+      all 10 tests pass.
 
 - [ ] **1.3 🔴 Harden FTS `MATCH`** — `src/db.py:242`
       - Sanitize/quote the user query before `chunks_fts MATCH ?` (e.g. wrap tokens in

@@ -58,8 +58,8 @@ def retrieve_chunks_for_query(query: str, limit: int = 5) -> list:
                 
             if query_vector:
                 q_vec = np.array(query_vector, dtype=np.float32)
-                all_chunks = db.get_all_chunks_with_embeddings()
-                
+                all_chunks = db.get_all_chunks_with_embeddings(expected_dim=len(q_vec))
+
                 if all_chunks:
                     chunk_embeddings = np.array([c["embedding"] for c in all_chunks], dtype=np.float32)
                     chunk_ids = [c["id"] for c in all_chunks]

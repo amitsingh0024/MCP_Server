@@ -144,9 +144,9 @@ def handle_search(args):
                 
             if query_vector:
                 q_vec = np.array(query_vector, dtype=np.float32)
-                # Load all chunk embeddings
-                all_chunks = db.get_all_chunks_with_embeddings()
-                
+                # Load all chunk embeddings matching the query vector's dimension
+                all_chunks = db.get_all_chunks_with_embeddings(expected_dim=len(q_vec))
+
                 if all_chunks:
                     chunk_embeddings = np.array([c["embedding"] for c in all_chunks], dtype=np.float32)
                     chunk_ids = [c["id"] for c in all_chunks]

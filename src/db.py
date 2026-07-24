@@ -1,7 +1,10 @@
 import sqlite3
+import logging
 import numpy as np
 from pathlib import Path
 from src.config import get_config
+
+logger = logging.getLogger("pdfspecs.db")
 
 def get_connection():
     config = get_config()
@@ -40,10 +43,19 @@ def init_db():
         text_content TEXT NOT NULL,
         summary TEXT,
         embedding BLOB,
+        embedding_model TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
     );
     """)
+
+    # Auto-migration for existing databases: record which model produced each
+    # embedding so a provider/model switch (different vector dim) can be detected
+    # instead of silently corrupting the similarity matrix.
+    try:
+        cursor.execute("ALTER TABLE chunks ADD COLUMN embedding_model TEXT;")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     # Create entities table
     cursor.execute("""
@@ -180,12 +192,12 @@ def delete_document(doc_id):
             cursor.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", [(cid,) for cid in chunk_ids])
         cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
-def add_chunk(chunk_id, document_id, page_start, page_end, text_content, summary, embedding):
+def add_chunk(chunk_id, document_id, page_start, page_end, text_content, summary, embedding, embedding_model=None):
     embedding_blob = serialize_embedding(embedding)
     with get_connection() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO chunks (id, document_id, page_start, page_end, text_content, summary, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (chunk_id, document_id, page_start, page_end, text_content, summary, embedding_blob)
+            "INSERT OR REPLACE INTO chunks (id, document_id, page_start, page_end, text_content, summary, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (chunk_id, document_id, page_start, page_end, text_content, summary, embedding_blob, embedding_model)
         )
         try:
             conn.execute(
@@ -205,18 +217,42 @@ def get_chunks_for_document(document_id):
             result.append(d)
         return result
 
-def get_all_chunks_with_embeddings():
+def get_all_chunks_with_embeddings(expected_dim=None):
+    """
+    Returns chunks that have a stored embedding.
+
+    If `expected_dim` is given (the dimension of the current query vector), only
+    embeddings of that exact dimension are returned. This prevents a ragged matrix
+    when the corpus contains embeddings from more than one model/provider (e.g. after
+    switching from Gemini's 768-d to NVIDIA's 1024-d vectors), which would otherwise
+    make the similarity computation throw and silently disable semantic search.
+    """
     with get_connection() as conn:
-        rows = conn.execute("SELECT id, document_id, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
+        rows = conn.execute(
+            "SELECT id, document_id, embedding, embedding_model FROM chunks WHERE embedding IS NOT NULL"
+        ).fetchall()
         result = []
+        skipped = 0
         for r in rows:
             emb = deserialize_embedding(r["embedding"])
-            if emb is not None and len(emb) > 0:
-                result.append({
-                    "id": r["id"],
-                    "document_id": r["document_id"],
-                    "embedding": emb
-                })
+            if emb is None or len(emb) == 0:
+                continue
+            if expected_dim is not None and len(emb) != expected_dim:
+                skipped += 1
+                continue
+            result.append({
+                "id": r["id"],
+                "document_id": r["document_id"],
+                "embedding": emb,
+                "embedding_model": r["embedding_model"],
+            })
+        if skipped:
+            logger.warning(
+                "Excluded %d chunk(s) from semantic search: their embedding dimension "
+                "does not match the current query model (expected_dim=%s). Re-ingest "
+                "those documents under the active embedding model to include them.",
+                skipped, expected_dim,
+            )
         return result
 
 def add_entity(entity_id, name, entity_type):

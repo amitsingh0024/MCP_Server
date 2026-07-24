@@ -354,11 +354,14 @@ def enrich_chunk(text: str) -> dict:
 
     # 2. Generate Embedding
     embedding = None
+    embedding_model = None
     try:
         if config.provider == "gemini":
             embedding = _call_gemini_embedding(text, config.gemini_api_key, config.embedding_model)
         elif config.provider == "nvidia":
             embedding = _call_nvidia_embedding(text, config.nvidia_api_key, config.embedding_model, input_type="passage")
+        if embedding:
+            embedding_model = config.embedding_model
     except Exception as e:
         logger.error(f"Failed to generate embedding for chunk: {e}")
         # Return empty list or fallback to None. RAG will fallback to lexical search if embedding is missing
@@ -368,5 +371,6 @@ def enrich_chunk(text: str) -> dict:
         "summary": summary,
         "keywords": keywords,
         "entities": cleaned_entities,
-        "embedding": embedding
+        "embedding": embedding,
+        "embedding_model": embedding_model,
     }
