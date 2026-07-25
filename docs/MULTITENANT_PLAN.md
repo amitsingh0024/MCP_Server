@@ -93,8 +93,13 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       *Verified:* full unit suite (mocked JWKS) + live-DB org bootstrap + key roundtrip pass.
       *Remaining:* FastAPI dependency wrappers + endpoints (in the M5/M6 server rewrite) and
       the frontend Google-login UI + dashboard shell.
-- [ ] **M4 — File storage.** Uploads → Supabase Storage under `org_id/`; worker downloads
-      to a temp path to parse; enforce `max_upload_mb` (FIXPLAN 3.4).
+- [x] **M4 — File storage.** Done: `src/storage.py` (Supabase Storage REST API, no SDK).
+      `upload_bytes` → `<org_id>/<uuid>-<safe-filename>`; `download_to_path` for the worker;
+      `delete_object`; `safe_filename` strips path traversal. Private `pdf-uploads` bucket
+      created (PDF-only, 50 MB cap). *Verified* live round-trip: sanitize → upload → download
+      (byte-exact) → delete → confirm gone.
+      *In M5:* wire the API upload endpoint to enforce the configured `max_upload_mb`
+      (FIXPLAN 3.4) before calling `upload_bytes`, and have the worker pull via `download_to_path`.
 - [ ] **M5 — Ingestion/worker on hosting.** Adapt the worker to the hosted process model;
       pull each org's provider key from `org_settings`; keep OCR pipeline (Tesseract lang
       packs installed in the Docker image).
