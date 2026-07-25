@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends, 
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 import src.pgdb as pgdb
 import src.auth as auth
@@ -222,7 +223,21 @@ def _mcp_org() -> str:
     return org
 
 
-mcp = FastMCP("OpenPDFSpecs")
+# FastMCP's DNS-rebinding protection defaults to allowing only localhost Host headers,
+# which 421-rejects the platform hostname when hosted. Our MCPAuthMiddleware already
+# authenticates every /mcp request with an org API key (unauthenticated callers get 401
+# first), so the host check is redundant here. Allow it to be scoped via env, else disable.
+_mcp_hosts = [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+if _mcp_hosts:
+    _mcp_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_mcp_hosts,
+        allowed_origins=[o.strip() for o in os.getenv("MCP_ALLOWED_ORIGINS", "*").split(",") if o.strip()],
+    )
+else:
+    _mcp_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+mcp = FastMCP("OpenPDFSpecs", transport_security=_mcp_security)
 
 
 @mcp.tool()
