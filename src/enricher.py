@@ -189,28 +189,37 @@ def _call_nvidia_embedding(text: str, api_key: str, model: str, input_type: str 
         "Content-Type": "application/json"
     }
     
-    # Truncate to safe character limit (1000 characters) to prevent 400 Bad Request
-    # 1000 characters is guaranteed to be under 512 tokens even for symbol-dense markdown tables
-    if len(text) > 1000:
-        safe_text = text[:1000]
-        logger.warning(f"Truncated embedding input from {len(text)} to 1000 characters to avoid NVIDIA 512 token limit.")
-    else:
-        safe_text = text
+    # nv-embedqa-e5-v5 caps input at ~512 tokens. Rather than truncate a long chunk (which
+    # would drop most of its content and weaken semantic search), split it into windows that
+    # each fit the limit, embed them in a single batched request, and mean-pool the window
+    # vectors into one embedding representing the whole chunk. Short text stays a single window.
+    EMBED_WINDOW_CHARS = 1000   # conservative: < 512 tokens even for symbol-dense/Devanagari text
+    MAX_WINDOWS = 8             # cap payload size for very large chunks
+    text = text or ""
+    windows = [text[i:i + EMBED_WINDOW_CHARS] for i in range(0, len(text), EMBED_WINDOW_CHARS)]
+    windows = windows[:MAX_WINDOWS] or [""]
 
     payload = {
-        "input": [safe_text],
+        "input": windows,
         "model": model,
         "encoding_format": "float",
-        "input_type": input_type
+        "input_type": input_type,
     }
     response = _post_with_retry(url, json_payload=payload, headers=headers)
-    
+
     data = response.json()
     try:
-        embedding = data["data"][0]["embedding"]
+        items = sorted(data["data"], key=lambda d: d.get("index", 0))
+        vectors = [it["embedding"] for it in items]
         usage = data.get("usage", {})
         _record_usage(usage_sink, purpose, usage.get("prompt_tokens", 0), 0)
-        return embedding
+        if len(vectors) == 1:
+            return vectors[0]
+        # Mean-pool the window embeddings. Cosine similarity is scale-invariant, so the
+        # average direction represents the chunk without needing renormalization.
+        n = len(vectors)
+        dim = len(vectors[0])
+        return [sum(v[j] for v in vectors) / n for j in range(dim)]
     except (KeyError, IndexError) as e:
         logger.error(f"Failed to extract embedding from Nvidia: {e}. Raw response: {data}")
         raise ValueError("Invalid embedding response format from Nvidia NIM API")
