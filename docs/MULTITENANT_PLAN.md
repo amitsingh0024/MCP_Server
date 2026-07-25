@@ -131,8 +131,13 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       (inverts FIXPLAN 2.1/2.4). *Verified locally:* the exact container CMD boots against the
       live DB (`/health` 200, unauth 401, worker starts); env-based encrypt/decrypt roundtrip.
       `docs/M7_DEPLOY.md` checklist written.
-      *User-side:* push repo to GitHub, create the Render service, set env vars, deploy.
-      *Then:* frontend (Vercel) — Google-login UI + dashboard; live MCP-client test.
+      *User-side:* push repo to GitHub (done), create the Render service, set env vars, deploy.
+      Frontend build done: Next.js dashboard (`frontend/src/app/page.tsx` + `lib/supabase.ts`,
+      `lib/api.ts`): Supabase Google login gate, JWT-aware API client, org-scoped panels
+      (Documents/Queue, Ingest, Search, API Keys w/ MCP connect URL, BYO-key Settings), token
+      metrics. Builds + typechecks clean; login screen renders (no console errors).
+      *User-side remaining:* add redirect URLs in Supabase Auth (localhost:3000 + Vercel URL);
+      deploy backend (Render) + frontend (Vercel); then the live Google-login + MCP-client test.
 - [ ] **M8 — Hardening.** Per-org rate limits/quotas; automated cross-tenant isolation
       tests (org A can never read org B); portable tests; remove local-first artifacts.
 
