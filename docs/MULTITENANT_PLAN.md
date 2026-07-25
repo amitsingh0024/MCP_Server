@@ -100,9 +100,15 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       (byte-exact) → delete → confirm gone.
       *In M5:* wire the API upload endpoint to enforce the configured `max_upload_mb`
       (FIXPLAN 3.4) before calling `upload_bytes`, and have the worker pull via `download_to_path`.
-- [ ] **M5 — Ingestion/worker on hosting.** Adapt the worker to the hosted process model;
-      pull each org's provider key from `org_settings`; keep OCR pipeline (Tesseract lang
-      packs installed in the Docker image).
+- [x] **M5 — Ingestion/worker on hosting.** Done: `src/ingest.py` (org-scoped worker) +
+      `enricher.py` refactor (accepts a per-org `ProviderSettings` + injectable `usage_sink`,
+      backward-compatible). Pipeline: download from storage → parse → diff-skip → chunk →
+      **parallel enrich** (ThreadPoolExecutor, FIXPLAN 3.1) with the org's BYO key → store
+      chunks/entities/keywords org-scoped; token usage recorded per org. Retry-with-cap
+      (FIXPLAN 3.5). OCR pipeline unchanged (Tesseract packs go in the Docker image at M7).
+      *Verified* live (DB + bucket, enrichment stubbed to avoid API cost): real PDF → 65
+      chunks/entities/keywords; search + org metrics; diff-skip; fail-at-cap cleans partial
+      doc; retry requeues. All pass.
 - [ ] **M6 — MCP over HTTP.** Expose MCP via Streamable HTTP/SSE; API key → `org_id`;
       scope `list_documents`/`search_knowledge`/`retrieve_chunk`/`entity_lookup` by org.
 - [ ] **M7 — Deploy.** Dockerfile (tesseract-ocr-{hin,san}); deploy backend (Render) +

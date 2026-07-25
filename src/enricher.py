@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from dataclasses import dataclass
 import requests
 from requests.exceptions import RequestException, HTTPError
 from src.config import get_config
@@ -9,6 +10,35 @@ logger = logging.getLogger("pdfspecs.enricher")
 
 class APIKeyMissingError(ValueError):
     pass
+
+
+@dataclass
+class ProviderSettings:
+    """Explicit provider config for a single enrichment call.
+
+    Mirrors the attribute names on the global Config so either can be passed as
+    `settings`. Used to run enrichment with a specific org's BYO key in the
+    multi-tenant worker instead of reading process-global config.
+    """
+    provider: str = "gemini"
+    gemini_api_key: str = ""
+    nvidia_api_key: str = ""
+    llm_model: str = "gemini-2.5-flash"
+    embedding_model: str = "text-embedding-004"
+
+
+def _record_usage(usage_sink, purpose, prompt_tokens, completion_tokens):
+    """Record token usage via an injected sink, else the legacy SQLite recorder."""
+    if not (prompt_tokens or completion_tokens):
+        return
+    try:
+        if usage_sink is not None:
+            usage_sink(purpose, prompt_tokens, completion_tokens)
+        else:
+            from src.db import record_token_usage
+            record_token_usage(purpose, prompt_tokens, completion_tokens)
+    except Exception as e:
+        logger.error(f"Failed to record token usage: {e}")
 
 def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1.5):
     """Executes a POST request with exponential backoff for transient errors."""
@@ -31,7 +61,7 @@ def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1
             logger.warning(f"API request failed: {e}. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
             time.sleep(sleep_time)
 
-def _call_gemini_llm(text: str, api_key: str, model: str) -> dict:
+def _call_gemini_llm(text: str, api_key: str, model: str, usage_sink=None) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     prompt = f"""Analyze the following text chunk from a document. Extract:
@@ -69,14 +99,8 @@ Text chunk:
     
     # Record token usage
     usage = data.get("usageMetadata", {})
-    prompt_tokens = usage.get("promptTokenCount", 0)
-    completion_tokens = usage.get("candidatesTokenCount", 0)
-    if prompt_tokens or completion_tokens:
-        try:
-            from src.db import record_token_usage
-            record_token_usage("ingestion", prompt_tokens, completion_tokens)
-        except Exception as e:
-            logger.error(f"Failed to record token usage: {e}")
+    _record_usage(usage_sink, "ingestion",
+                  usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
 
     try:
         content_str = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -85,7 +109,7 @@ Text chunk:
         logger.error(f"Failed to parse Gemini response: {e}. Raw response: {data}")
         raise ValueError("Invalid response format from Gemini API")
 
-def _call_nvidia_llm(text: str, api_key: str, model: str) -> dict:
+def _call_nvidia_llm(text: str, api_key: str, model: str, usage_sink=None) -> dict:
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     
     prompt = f"""Analyze the following text chunk from a document. Extract:
@@ -125,14 +149,8 @@ Text chunk:
     
     # Record token usage
     usage = data.get("usage", {})
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    if prompt_tokens or completion_tokens:
-        try:
-            from src.db import record_token_usage
-            record_token_usage("ingestion", prompt_tokens, completion_tokens)
-        except Exception as e:
-            logger.error(f"Failed to record token usage: {e}")
+    _record_usage(usage_sink, "ingestion",
+                  usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
 
     try:
         content_str = data["choices"][0]["message"]["content"]
@@ -158,7 +176,7 @@ def _call_gemini_embedding(text: str, api_key: str, model: str) -> list:
         logger.error(f"Failed to extract embedding from Gemini: {e}. Raw response: {data}")
         raise ValueError("Invalid embedding response format from Gemini API")
 
-def _call_nvidia_embedding(text: str, api_key: str, model: str, input_type: str = "passage", purpose: str = "ingestion") -> list:
+def _call_nvidia_embedding(text: str, api_key: str, model: str, input_type: str = "passage", purpose: str = "ingestion", usage_sink=None) -> list:
     url = "https://integrate.api.nvidia.com/v1/embeddings"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -185,13 +203,7 @@ def _call_nvidia_embedding(text: str, api_key: str, model: str, input_type: str 
     try:
         embedding = data["data"][0]["embedding"]
         usage = data.get("usage", {})
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        if prompt_tokens:
-            try:
-                from src.db import record_token_usage
-                record_token_usage(purpose, prompt_tokens, 0)
-            except Exception as e:
-                logger.error(f"Failed to record embedding token usage: {e}")
+        _record_usage(usage_sink, purpose, usage.get("prompt_tokens", 0), 0)
         return embedding
     except (KeyError, IndexError) as e:
         logger.error(f"Failed to extract embedding from Nvidia: {e}. Raw response: {data}")
@@ -309,30 +321,33 @@ Response:"""
         return f"Error: Unsupported provider: {config.provider}"
 
 
-def enrich_chunk(text: str) -> dict:
+def enrich_chunk(text: str, settings=None, usage_sink=None) -> dict:
     """
-    Calls the configured LLM and Embedding provider to extract metadata
-    and compute a vector representation for a chunk of text.
-    Returns:
-        dict: {
-            "summary": str,
-            "keywords": [str, ...],
-            "entities": [{"name": str, "type": str}, ...],
-            "embedding": [float, ...]
-        }
+    Calls the LLM and Embedding provider to extract metadata and compute a vector
+    for a chunk of text.
+
+    Args:
+        text: the chunk text.
+        settings: an optional ProviderSettings (or Config) supplying provider/keys/models.
+            When None, falls back to the process-global config (legacy single-user path).
+            The multi-tenant worker passes a per-org ProviderSettings here (BYO key).
+        usage_sink: optional callable(purpose, prompt_tokens, completion_tokens) to record
+            token usage (e.g. org-scoped via pgdb). When None, the legacy SQLite recorder is used.
+
+    Returns dict: {summary, keywords, entities, embedding, embedding_model}
     """
-    config = get_config()
-    
+    config = settings or get_config()
+
     # 1. Generate Metadata
     metadata = {}
     if config.provider == "gemini":
         if not config.gemini_api_key:
             raise APIKeyMissingError("Gemini API key is missing. Please set it in config.json or GEMINI_API_KEY environment variable.")
-        metadata = _call_gemini_llm(text, config.gemini_api_key, config.llm_model)
+        metadata = _call_gemini_llm(text, config.gemini_api_key, config.llm_model, usage_sink=usage_sink)
     elif config.provider == "nvidia":
         if not config.nvidia_api_key:
             raise APIKeyMissingError("Nvidia API key is missing. Please set it in config.json or NVIDIA_API_KEY environment variable.")
-        metadata = _call_nvidia_llm(text, config.nvidia_api_key, config.llm_model)
+        metadata = _call_nvidia_llm(text, config.nvidia_api_key, config.llm_model, usage_sink=usage_sink)
     else:
         raise ValueError(f"Unsupported provider: {config.provider}")
 
@@ -340,7 +355,7 @@ def enrich_chunk(text: str) -> dict:
     summary = metadata.get("summary", "")
     keywords = metadata.get("keywords", [])
     entities = metadata.get("entities", [])
-    
+
     # Clean up entities (normalize types and names)
     cleaned_entities = []
     valid_types = {"concept", "organization", "person", "location"}
@@ -359,7 +374,7 @@ def enrich_chunk(text: str) -> dict:
         if config.provider == "gemini":
             embedding = _call_gemini_embedding(text, config.gemini_api_key, config.embedding_model)
         elif config.provider == "nvidia":
-            embedding = _call_nvidia_embedding(text, config.nvidia_api_key, config.embedding_model, input_type="passage")
+            embedding = _call_nvidia_embedding(text, config.nvidia_api_key, config.embedding_model, input_type="passage", usage_sink=usage_sink)
         if embedding:
             embedding_model = config.embedding_model
     except Exception as e:
