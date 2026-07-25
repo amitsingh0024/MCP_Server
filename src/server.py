@@ -247,7 +247,29 @@ else:
 # `?token=` query param rides along on every request (unlike SSE, whose server-generated
 # message endpoint dropped it). streamable_http_path="/" so the mount at "/mcp" yields "/mcp".
 # json_response=True returns plain JSON for POSTs so clients that don't accept SSE still work.
-mcp = FastMCP("OpenPDFSpecs", stateless_http=True, json_response=True,
+# Server-level instructions are delivered to the connecting AI on initialize, so it knows
+# what this knowledgebase is and how to use the tools without any extra prompting.
+MCP_INSTRUCTIONS = """\
+OpenPDFSpecs is a searchable knowledgebase of classical Ayurvedic texts (e.g. Charaka \
+Samhita, Sushruta Samhita, Ashtanga Hridayam/Sangraha by Vagbhata, Yogaratnakara).
+
+Use these tools to answer questions grounded in the source texts:
+- search_knowledge(query, limit=5): hybrid lexical + semantic search. Best first step for
+  any question. Query by symptom, condition, treatment, herb, or concept (e.g. "treatment
+  for fever", "jwara", "uses of guduchi"). Returns matching passages with a summary, the
+  source file, page range, and a chunk_id.
+- retrieve_chunk(chunk_id): read the full text of a specific chunk returned by a search.
+- entity_lookup(entity_name): find every passage where a concept, herb, person, or term
+  appears across the library.
+- list_documents_tool(): list the source documents available.
+
+Guidance: search first, then retrieve_chunk for detail before answering. Ground answers in
+retrieved content and cite the source file and page range. If nothing relevant is found,
+say so rather than guessing. These are historical texts, not medical advice.
+"""
+
+mcp = FastMCP("OpenPDFSpecs", instructions=MCP_INSTRUCTIONS,
+              stateless_http=True, json_response=True,
               streamable_http_path="/", transport_security=_mcp_security)
 
 
