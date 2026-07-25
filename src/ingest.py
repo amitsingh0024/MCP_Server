@@ -26,7 +26,10 @@ logger = logging.getLogger("pdfspecs.ingest")
 
 # Fixed platform embedding model/dim (must match chunks.embedding vector(768)).
 def _enrich_concurrency() -> int:
-    return max(1, int(os.getenv("PDFSPECS_ENRICH_CONCURRENCY", "4")))
+    # Default 1: the global request throttle in enricher already caps the rate, so extra
+    # workers would just queue on it. Override with PDFSPECS_ENRICH_CONCURRENCY if a provider
+    # key has generous limits.
+    return max(1, int(os.getenv("PDFSPECS_ENRICH_CONCURRENCY", "1")))
 
 
 def _max_attempts() -> int:

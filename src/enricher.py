@@ -1,6 +1,8 @@
+import os
 import json
 import logging
 import time
+import threading
 from dataclasses import dataclass
 import requests
 from requests.exceptions import RequestException, HTTPError
@@ -10,6 +12,26 @@ logger = logging.getLogger("pdfspecs.enricher")
 
 class APIKeyMissingError(ValueError):
     pass
+
+
+# Global request throttle — spaces out ALL provider API calls (across worker threads) to
+# respect free-tier rate limits (e.g. NVIDIA 429s). Ingestion gets slower but reliable.
+# PDFSPECS_API_MIN_INTERVAL seconds between request starts; 0 disables. Default ~40 req/min.
+_MIN_API_INTERVAL = float(os.getenv("PDFSPECS_API_MIN_INTERVAL", "1.5"))
+_rate_lock = threading.Lock()
+_last_request_ts = 0.0
+
+
+def _throttle():
+    """Block until at least _MIN_API_INTERVAL has elapsed since the last request start."""
+    global _last_request_ts
+    if _MIN_API_INTERVAL <= 0:
+        return
+    with _rate_lock:  # held across the sleep so all threads are spaced globally
+        wait = _last_request_ts + _MIN_API_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_ts = time.monotonic()
 
 
 # Embedding model per provider. Their output dimensions differ (Gemini 768, NVIDIA 1024),
@@ -47,9 +69,10 @@ def _record_usage(usage_sink, purpose, prompt_tokens, completion_tokens):
         logger.error(f"Failed to record token usage: {e}")
 
 def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1.5):
-    """Executes a POST request with exponential backoff for transient errors."""
+    """Executes a POST request with global throttling + exponential backoff for transient errors."""
     for attempt in range(max_retries):
         try:
+            _throttle()  # respect the provider's rate limit (every attempt counts)
             response = requests.post(url, json=json_payload, headers=headers, timeout=45)
             response.raise_for_status()
             return response
