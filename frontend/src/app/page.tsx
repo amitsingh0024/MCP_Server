@@ -370,7 +370,7 @@ function KeysPanel() {
     await apiFetch(`/api/v1/keys/${hash}`, { method: "DELETE" });
     load();
   };
-  const mcpUrl = fresh ? `${API_BASE}/mcp/sse?token=${fresh}` : "";
+  const mcpUrl = fresh ? `${API_BASE}/mcp?token=${fresh}` : "";
 
   return (
     <div className="space-y-6">
@@ -388,7 +388,7 @@ function KeysPanel() {
               <code className="flex-1 truncate rounded bg-black/40 px-3 py-2 text-xs">{fresh}</code>
               <Button variant="ghost" onClick={() => copy(fresh, "key")}>{copied === "key" ? "Copied" : "Copy"}</Button>
             </div>
-            <p className="mt-3 text-xs text-gray-400">Connect an MCP client (Claude/Cursor) with:</p>
+            <p className="mt-3 text-xs text-gray-400">Paste this URL into your AI tool (Claude, Cursor, …) as a custom MCP connector:</p>
             <div className="mt-1 flex items-center gap-2">
               <code className="flex-1 truncate rounded bg-black/40 px-3 py-2 text-xs">{mcpUrl}</code>
               <Button variant="ghost" onClick={() => copy(mcpUrl, "url")}>{copied === "url" ? "Copied" : "Copy"}</Button>
