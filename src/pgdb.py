@@ -43,7 +43,9 @@ def get_pool() -> ConnectionPool:
             conninfo=dsn,
             min_size=1,
             max_size=int(os.getenv("PDFSPECS_PG_POOL_MAX", "5")),
-            kwargs={"autocommit": True, "row_factory": dict_row},
+            # prepare_threshold=None disables client-side prepared statements, which
+            # otherwise break under Supabase's transaction-mode pooler (pgbouncer).
+            kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": None},
             configure=_configure,
             open=True,
         )

@@ -59,10 +59,11 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
 
 ## Migration phases (execute one at a time, like Phase 1)
 
-- [~] **M0 — Provision & scaffold.** Code side done: `.env.example` + `docs/M0_PROVISIONING.md`
-      checklist; embedding model locked to text-embedding-004 / 768-d; `.env` gitignored.
-      *Waiting on user:* create Supabase project, run the two migrations, Google OAuth creds,
-      storage bucket, Fernet key (see the checklist). Hosting accounts deferred to M7.
+- [~] **M0 — Provision & scaffold.** Supabase project live (ap-northeast-1, PG 17.6);
+      `vector` extension enabled; both migrations applied; `.env` filled with new-model keys
+      (secret/publishable/JWKS) + working `DATABASE_URL`. `.env.example` + checklist done.
+      *Still user-side (for later milestones):* Google OAuth creds (M3), storage bucket (M4),
+      Fernet key, hosting accounts (M7).
 - [x] **M1 — Postgres schema + tenancy + RLS.** Done: `db/migrations/0001_init_schema.sql`
       (tables, pgvector `vector(768)`, generated `tsvector`, org_id + cascades, composite
       entity FK, HNSW/GIN indexes) and `0002_rls_policies.sql` (RLS + `current_org_id()`).
@@ -77,7 +78,9 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       org_id; per-org metrics. Deps added (`psycopg[binary]`, `psycopg-pool`, `pgvector`).
       *Verified* against local Postgres (pgvector shimmed): all functions pass incl.
       cross-org isolation for docs/chunks/lexical/entities/settings/keys/metrics.
-      *Deferred to live Supabase:* `search_semantic` (`<=>`) needs the real pgvector ext.
+      *Validated on live Supabase (PG 17.6):* connection + pool (`prepare_threshold=None`
+      for the pooler), all 10 tables, and `search_semantic` real pgvector `<=>` nearest
+      neighbor + `tsvector` lexical — all pass.
       *Not yet wired:* callsites (queue/mcp/server/cli) still use the old SQLite `src/db.py`;
       they move onto `pgdb` in M5/M6 once orgs exist (needs the M3 auth/org bootstrap first).
 - [ ] **M3 — Admin auth.** Supabase Google login on the frontend; backend verifies the
