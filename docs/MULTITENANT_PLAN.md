@@ -123,9 +123,16 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       *Verified* live: unauth 401 on REST + `/mcp`; admin endpoints org-scoped; agent API-key
       search with cross-org isolation; bad key 401.
       *Deferred:* full MCP SSE handshake needs a live client (M7).
-- [ ] **M7 — Deploy.** Dockerfile (tesseract-ocr-{hin,san}); deploy backend (Render) +
-      frontend (Vercel); public bind; CORS locked to the Vercel domain; secrets via env.
-      (This *inverts* FIXPLAN 2.1/2.4, which targeted loopback/localhost.)
+- [~] **M7 — Deploy.** Backend containerization done: `Dockerfile` (python:3.12-slim +
+      tesseract eng/hin/san), `.dockerignore`, `render.yaml` (free Docker web service,
+      Singapore, `/health` check, env-var secrets). `crypto_utils` now takes the Fernet key
+      from `PDFSPECS_FERNET_KEY` env (was a local file — would regenerate per deploy on an
+      ephemeral container and break decryption). Public bind via `$PORT`; CORS from env
+      (inverts FIXPLAN 2.1/2.4). *Verified locally:* the exact container CMD boots against the
+      live DB (`/health` 200, unauth 401, worker starts); env-based encrypt/decrypt roundtrip.
+      `docs/M7_DEPLOY.md` checklist written.
+      *User-side:* push repo to GitHub, create the Render service, set env vars, deploy.
+      *Then:* frontend (Vercel) — Google-login UI + dashboard; live MCP-client test.
 - [ ] **M8 — Hardening.** Per-org rate limits/quotas; automated cross-tenant isolation
       tests (org A can never read org B); portable tests; remove local-first artifacts.
 

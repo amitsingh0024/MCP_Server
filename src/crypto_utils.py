@@ -7,14 +7,26 @@ KEY_PATH = Path.home() / ".pdfspecs" / "secret.key"
 _fernet_instance = None
 
 def init_crypto():
-    """Initializes the Fernet encryption instance, generating a key if needed."""
+    """Initializes the Fernet encryption instance.
+
+    Precedence:
+      1. PDFSPECS_FERNET_KEY env var — REQUIRED for hosted/multi-tenant deployments,
+         where the container filesystem is ephemeral (a per-deploy random file key would
+         make previously-encrypted org keys undecryptable).
+      2. Local key file (~/.pdfspecs/secret.key) — convenience for local single-user dev.
+    """
     global _fernet_instance
     if _fernet_instance is not None:
         return
 
+    env_key = os.getenv("PDFSPECS_FERNET_KEY")
+    if env_key:
+        _fernet_instance = Fernet(env_key.encode("utf-8"))
+        return
+
     # Ensure app directory exists
     KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    
+
     if not KEY_PATH.exists():
         # Generate new random 32-byte key
         key = Fernet.generate_key()

@@ -1,0 +1,30 @@
+# Render blueprint for the OpenPDFSpecs backend (Docker web service).
+# Secrets are marked sync:false — set their values in the Render dashboard, not here.
+services:
+  - type: web
+    name: openpdfspecs-api
+    runtime: docker
+    plan: free
+    region: singapore            # closest free region to the Supabase ap-northeast-1 DB
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # --- Postgres / Supabase (secrets) ---
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_JWKS_URL
+        sync: false
+      - key: PDFSPECS_FERNET_KEY
+        sync: false
+      # --- Non-secret config ---
+      - key: SUPABASE_STORAGE_BUCKET
+        value: pdf-uploads
+      - key: PDFSPECS_EMBEDDING_MODEL
+        value: text-embedding-004
+      # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
+      - key: CORS_ORIGINS
+        sync: false

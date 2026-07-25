@@ -1,0 +1,19 @@
+# Keep the build context small — only requirements.txt + src/ are needed.
+.venv/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+ingestion_files/
+frontend/
+docs/
+tests/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+.DS_Store
+.pytest_cache/
+openpdfspecs.db
