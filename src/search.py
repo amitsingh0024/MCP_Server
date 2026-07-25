@@ -24,7 +24,7 @@ def _org_settings(org_id: str) -> enricher.ProviderSettings:
         provider=provider,
         gemini_api_key=pgdb.get_setting(org_id, "gemini_api_key", decrypt=True),
         nvidia_api_key=pgdb.get_setting(org_id, "nvidia_api_key", decrypt=True),
-        embedding_model=pgdb.get_setting(org_id, "embedding_model") or "text-embedding-004",
+        embedding_model=enricher.default_embedding_model(provider),
     )
 
 

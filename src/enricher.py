@@ -12,6 +12,16 @@ class APIKeyMissingError(ValueError):
     pass
 
 
+# Embedding model per provider. Their output dimensions differ (Gemini 768, NVIDIA 1024),
+# so the platform standardizes on one — see PDFSPECS_EMBEDDING_DIM / the vector(N) column.
+GEMINI_EMBEDDING_MODEL = "text-embedding-004"      # 768-d
+NVIDIA_EMBEDDING_MODEL = "nvidia/nv-embedqa-e5-v5"  # 1024-d
+
+
+def default_embedding_model(provider: str) -> str:
+    return NVIDIA_EMBEDDING_MODEL if provider == "nvidia" else GEMINI_EMBEDDING_MODEL
+
+
 @dataclass
 class ProviderSettings:
     """Explicit provider config for a single enrichment call.

@@ -21,9 +21,9 @@ from pgvector.psycopg import register_vector
 
 logger = logging.getLogger("pdfspecs.pgdb")
 
-# Fixed platform-wide embedding dimension (Gemini text-embedding-004). Must match the
-# vector(N) column in db/migrations/0001_init_schema.sql.
-EMBEDDING_DIM = 768
+# Platform-wide embedding dimension. Must match the vector(N) column in the schema
+# (0003 sets it to 1024 for NVIDIA nv-embedqa-e5-v5; 768 was Gemini text-embedding-004).
+EMBEDDING_DIM = int(os.getenv("PDFSPECS_EMBEDDING_DIM", "1024"))
 
 _pool: ConnectionPool | None = None
 

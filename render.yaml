@@ -23,8 +23,10 @@ services:
       # --- Non-secret config ---
       - key: SUPABASE_STORAGE_BUCKET
         value: pdf-uploads
-      - key: PDFSPECS_EMBEDDING_MODEL
-        value: text-embedding-004
+      # Embedding dimension — must equal the vector(N) column (0003 set it to 1024 for
+      # NVIDIA nv-embedqa-e5-v5). The model itself is derived per provider in code.
+      - key: PDFSPECS_EMBEDDING_DIM
+        value: "1024"
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
         sync: false

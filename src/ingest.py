@@ -25,9 +25,6 @@ from src.config import get_config
 logger = logging.getLogger("pdfspecs.ingest")
 
 # Fixed platform embedding model/dim (must match chunks.embedding vector(768)).
-EMBEDDING_MODEL = os.getenv("PDFSPECS_EMBEDDING_MODEL", "text-embedding-004")
-
-
 def _enrich_concurrency() -> int:
     return max(1, int(os.getenv("PDFSPECS_ENRICH_CONCURRENCY", "4")))
 
@@ -47,8 +44,9 @@ def _org_provider_settings(org_id: str) -> enricher.ProviderSettings:
         gemini_api_key=pgdb.get_setting(org_id, "gemini_api_key", decrypt=True),
         nvidia_api_key=pgdb.get_setting(org_id, "nvidia_api_key", decrypt=True),
         llm_model=llm_model,
-        # Embedding model is fixed platform-wide so every vector is 768-d.
-        embedding_model=EMBEDDING_MODEL,
+        # Embedding model matches the provider; its dimension must equal the vector column
+        # (pgdb.EMBEDDING_DIM) or pgdb drops the vector (search falls back to lexical).
+        embedding_model=enricher.default_embedding_model(provider),
     )
 
 
