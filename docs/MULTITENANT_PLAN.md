@@ -83,9 +83,16 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       neighbor + `tsvector` lexical — all pass.
       *Not yet wired:* callsites (queue/mcp/server/cli) still use the old SQLite `src/db.py`;
       they move onto `pgdb` in M5/M6 once orgs exist (needs the M3 auth/org bootstrap first).
-- [ ] **M3 — Admin auth.** Supabase Google login on the frontend; backend verifies the
-      Supabase JWT on dashboard endpoints; on first login create the org row (bootstrap);
-      org-scoped API-key issuance with **hashed** storage (folds in FIXPLAN 2.2/2.3).
+- [~] **M3 — Admin auth.** Backend layer done: `src/auth.py` (transport-agnostic).
+      - Supabase user JWT verified via JWKS (`verify_supabase_jwt`); expired / wrong-audience
+        / tampered / empty all rejected.
+      - `authenticate_admin` bootstraps the caller's org on first login (idempotent).
+      - Org API keys: `generate_api_key` (raw `sk-pdfspecs-...` shown once) / `resolve_api_key`
+        → org_id; only the SHA-256 **hash** is stored (folds in FIXPLAN 2.2/2.3).
+      - Google provider enabled in Supabase; `pyjwt` added.
+      *Verified:* full unit suite (mocked JWKS) + live-DB org bootstrap + key roundtrip pass.
+      *Remaining:* FastAPI dependency wrappers + endpoints (in the M5/M6 server rewrite) and
+      the frontend Google-login UI + dashboard shell.
 - [ ] **M4 — File storage.** Uploads → Supabase Storage under `org_id/`; worker downloads
       to a temp path to parse; enforce `max_upload_mb` (FIXPLAN 3.4).
 - [ ] **M5 — Ingestion/worker on hosting.** Adapt the worker to the hosted process model;
