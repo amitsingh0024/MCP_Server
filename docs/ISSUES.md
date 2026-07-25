@@ -7,6 +7,25 @@ Status key: 🔴 Open · 🟡 In progress · ✅ Fixed
 
 ---
 
+## ISSUE-3 — MCP URL-token auth doesn't cover the SSE message channel
+- **Status:** 🔴 Open (header auth works; URL-token does not)
+- **What happens:** With the key in the URL (`/mcp/sse?token=…`), the initial SSE GET
+  authenticates, but the client then POSTs to the server-generated `/mcp/messages/?session_id=…`
+  URL, which has no token → `MCPAuthMiddleware` returns 401 and the handshake fails.
+  Header auth (`Authorization: Bearer`) works because the client sends it on every request.
+- **Impact:** Clients that only accept a URL (e.g. claude.ai custom connectors) can't connect.
+  Header-capable clients (Claude Code `--header`, Cursor headers, `mcp-remote --header`) work.
+- **Fix options:**
+  1. Switch the MCP transport from SSE to **Streamable HTTP** (`mcp.streamable_http_app()`) —
+     single endpoint, header auth on every request, and it's what modern connectors expect.
+  2. Session-based auth: authenticate at SSE connect, map `session_id` → org, and don't
+     re-require the token on the message channel.
+  - (1) is preferred — simpler and more compatible.
+- **Verified:** live handshake test against Render — header-auth=True, url-token=False (401
+  on `/mcp/messages/`).
+
+---
+
 ## ISSUE-2 — NVIDIA free-tier rate limit (429) during ingestion
 - **Status:** ✅ Fixed (commit adds a global request throttle)
 - **What happened:** Parallel enrichment (4 workers × LLM+embedding per chunk) burst past
