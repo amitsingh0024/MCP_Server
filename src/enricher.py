@@ -342,17 +342,30 @@ def enrich_chunk(text: str, settings=None, usage_sink=None) -> dict:
     else:
         raise ValueError(f"Unsupported provider: {config.provider}")
 
-    # Ensure format consistency
+    # Ensure format consistency. LLM output is untrusted: fields may be missing, the
+    # wrong type, or (as seen from some models) a list of non-dict items — guard everything.
     summary = metadata.get("summary", "")
-    keywords = metadata.get("keywords", [])
-    entities = metadata.get("entities", [])
+    if not isinstance(summary, str):
+        summary = str(summary) if summary is not None else ""
+
+    raw_keywords = metadata.get("keywords", [])
+    keywords = [k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()] \
+        if isinstance(raw_keywords, list) else []
+
+    raw_entities = metadata.get("entities", [])
+    if not isinstance(raw_entities, list):
+        raw_entities = []
 
     # Clean up entities (normalize types and names)
     cleaned_entities = []
     valid_types = {"concept", "organization", "person", "location"}
-    for ent in entities:
-        name = ent.get("name", "").strip()
-        etype = ent.get("type", "").strip().lower()
+    for ent in raw_entities:
+        if not isinstance(ent, dict):
+            continue  # skip malformed items (ints, bare strings, ...)
+        name = ent.get("name", "")
+        name = name.strip() if isinstance(name, str) else ""
+        etype = ent.get("type", "")
+        etype = etype.strip().lower() if isinstance(etype, str) else ""
         if etype not in valid_types:
             etype = "concept"
         if name:
