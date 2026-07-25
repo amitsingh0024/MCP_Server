@@ -8,7 +8,7 @@ Status key: 🔴 Open · 🟡 In progress · ✅ Fixed
 ---
 
 ## ISSUE-3 — MCP URL-token auth doesn't cover the SSE message channel
-- **Status:** 🔴 Open (header auth works; URL-token does not)
+- **Status:** ✅ Fixed — switched to stateless Streamable HTTP (token-in-URL works). Verified locally.
 - **What happens:** With the key in the URL (`/mcp/sse?token=…`), the initial SSE GET
   authenticates, but the client then POSTs to the server-generated `/mcp/messages/?session_id=…`
   URL, which has no token → `MCPAuthMiddleware` returns 401 and the handshake fails.
