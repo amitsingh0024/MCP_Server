@@ -39,11 +39,17 @@ logger = logging.getLogger("pdfspecs.server")
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    pgdb.reset_stuck_tasks()
-    t = threading.Thread(target=ingest.run_worker_loop, daemon=True)
-    t.start()
-    logger.info("Background ingestion worker started.")
-    yield
+    # Background ingestion worker (skippable so a web-only replica or local test doesn't
+    # run a second worker against the shared DB).
+    if os.getenv("PDFSPECS_DISABLE_WORKER", "").lower() not in ("1", "true", "yes"):
+        pgdb.reset_stuck_tasks()
+        threading.Thread(target=ingest.run_worker_loop, daemon=True).start()
+        logger.info("Background ingestion worker started.")
+    else:
+        logger.info("Worker disabled (PDFSPECS_DISABLE_WORKER).")
+    # The Streamable HTTP session manager must be running to serve /mcp.
+    async with mcp.session_manager.run():
+        yield
     pgdb.close_pool()
 
 
@@ -237,7 +243,11 @@ if _mcp_hosts:
 else:
     _mcp_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
-mcp = FastMCP("OpenPDFSpecs", transport_security=_mcp_security)
+# Stateless Streamable HTTP: one endpoint the client always calls with the SAME URL, so a
+# `?token=` query param rides along on every request (unlike SSE, whose server-generated
+# message endpoint dropped it). streamable_http_path="/" so the mount at "/mcp" yields "/mcp".
+mcp = FastMCP("OpenPDFSpecs", stateless_http=True, streamable_http_path="/",
+              transport_security=_mcp_security)
 
 
 @mcp.tool()
@@ -325,7 +335,8 @@ class MCPAuthMiddleware:
             _current_org.reset(tok)
 
 
-app.mount("/mcp", MCPAuthMiddleware(mcp.sse_app()))
+_mcp_app = mcp.streamable_http_app()   # creates mcp.session_manager (run in lifespan)
+app.mount("/mcp", MCPAuthMiddleware(_mcp_app))
 
 
 if __name__ == "__main__":
