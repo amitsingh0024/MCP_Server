@@ -246,8 +246,9 @@ else:
 # Stateless Streamable HTTP: one endpoint the client always calls with the SAME URL, so a
 # `?token=` query param rides along on every request (unlike SSE, whose server-generated
 # message endpoint dropped it). streamable_http_path="/" so the mount at "/mcp" yields "/mcp".
-mcp = FastMCP("OpenPDFSpecs", stateless_http=True, streamable_http_path="/",
-              transport_security=_mcp_security)
+# json_response=True returns plain JSON for POSTs so clients that don't accept SSE still work.
+mcp = FastMCP("OpenPDFSpecs", stateless_http=True, json_response=True,
+              streamable_http_path="/", transport_security=_mcp_security)
 
 
 @mcp.tool()
@@ -328,6 +329,13 @@ class MCPAuthMiddleware:
         if not org_id:
             resp = JSONResponse({"detail": "Unauthorized: invalid or missing API key"}, status_code=401)
             return await resp(scope, receive, send)
+        # Normalize the Accept header so the Streamable HTTP transport's strict checks pass
+        # for lenient clients (some send only `application/json`, or omit it, and hit
+        # "Not Acceptable: Client must accept text/event-stream"). The server still returns
+        # JSON for POSTs (json_response=True); GET notification streams remain SSE.
+        rewritten = [(k, v) for (k, v) in scope.get("headers", []) if k.decode().lower() != "accept"]
+        rewritten.append((b"accept", b"application/json, text/event-stream"))
+        scope = {**scope, "headers": rewritten}
         tok = _current_org.set(org_id)
         try:
             await self.app(scope, receive, send)
