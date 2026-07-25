@@ -28,15 +28,11 @@ class ProviderSettings:
 
 
 def _record_usage(usage_sink, purpose, prompt_tokens, completion_tokens):
-    """Record token usage via an injected sink, else the legacy SQLite recorder."""
-    if not (prompt_tokens or completion_tokens):
+    """Record token usage via the injected sink (org-scoped). No-op without a sink."""
+    if not (prompt_tokens or completion_tokens) or usage_sink is None:
         return
     try:
-        if usage_sink is not None:
-            usage_sink(purpose, prompt_tokens, completion_tokens)
-        else:
-            from src.db import record_token_usage
-            record_token_usage(purpose, prompt_tokens, completion_tokens)
+        usage_sink(purpose, prompt_tokens, completion_tokens)
     except Exception as e:
         logger.error(f"Failed to record token usage: {e}")
 
@@ -210,7 +206,7 @@ def _call_nvidia_embedding(text: str, api_key: str, model: str, input_type: str 
         raise ValueError("Invalid embedding response format from Nvidia NIM API")
 
 
-def _call_gemini_synthesis(prompt: str, api_key: str, model: str) -> str:
+def _call_gemini_synthesis(prompt: str, api_key: str, model: str, usage_sink=None) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{
@@ -222,24 +218,16 @@ def _call_gemini_synthesis(prompt: str, api_key: str, model: str) -> str:
         response = _post_with_retry(url, json_payload=payload, headers=headers)
         data = response.json()
         
-        # Record token usage
         usage = data.get("usageMetadata", {})
-        prompt_tokens = usage.get("promptTokenCount", 0)
-        completion_tokens = usage.get("candidatesTokenCount", 0)
-        if prompt_tokens or completion_tokens:
-            try:
-                from src.db import record_token_usage
-                record_token_usage("sandbox", prompt_tokens, completion_tokens)
-            except Exception as e:
-                logger.error(f"Failed to record token usage: {e}")
-                
+        _record_usage(usage_sink, "sandbox",
+                      usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         logger.error(f"Gemini synthesis failed: {e}")
         return f"Failed to generate synthesis due to API error: {e}"
 
 
-def _call_nvidia_synthesis(prompt: str, api_key: str, model: str) -> str:
+def _call_nvidia_synthesis(prompt: str, api_key: str, model: str, usage_sink=None) -> str:
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -255,17 +243,10 @@ def _call_nvidia_synthesis(prompt: str, api_key: str, model: str) -> str:
         response = _post_with_retry(url, json_payload=payload, headers=headers)
         data = response.json()
         
-        # Record token usage
         usage = data.get("usage", {})
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        if prompt_tokens or completion_tokens:
-            try:
-                from src.db import record_token_usage
-                record_token_usage("sandbox", prompt_tokens, completion_tokens)
-            except Exception as e:
-                logger.error(f"Failed to record token usage: {e}")
-                
+        _record_usage(usage_sink, "sandbox",
+                      usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
         return data["choices"][0]["message"]["content"]
     except Exception as e:
         logger.error(f"Nvidia synthesis failed: {e}")

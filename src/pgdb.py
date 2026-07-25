@@ -195,7 +195,12 @@ def get_chunks_by_ids(org_id: str, chunk_ids: list) -> dict:
             """,
             (org_id, [str(c) for c in chunk_ids]),
         ).fetchall()
-        return {str(r["id"]): dict(r) for r in rows}
+        out = {}
+        for r in rows:
+            d = dict(r)
+            d["id"] = str(d["id"])
+            out[d["id"]] = d
+        return out
 
 
 # =====================================================================

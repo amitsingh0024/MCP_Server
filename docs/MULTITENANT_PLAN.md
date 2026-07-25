@@ -109,8 +109,20 @@ RLS: enabled on all tenant tables; policies key off the request's org context.
       *Verified* live (DB + bucket, enrichment stubbed to avoid API cost): real PDF → 65
       chunks/entities/keywords; search + org metrics; diff-skip; fail-at-cap cleans partial
       doc; retry requeues. All pass.
-- [ ] **M6 — MCP over HTTP.** Expose MCP via Streamable HTTP/SSE; API key → `org_id`;
-      scope `list_documents`/`search_knowledge`/`retrieve_chunk`/`entity_lookup` by org.
+- [x] **M6 — HTTP service + MCP (org-scoped).** Done.
+      - `src/search.py`: single hybrid search with proper RRF (FIXPLAN 3.3) shared by REST +
+        MCP (de-dups the old cli/mcp copies, FIXPLAN 4.1); query embedded with the org's key.
+      - `src/server.py` rewritten on pgdb/auth/storage/ingest/search. Two deps: `require_admin`
+        (Supabase JWT→org) and `require_api_key` (org key→org). Org-scoped endpoints: me, config
+        (BYO key), documents, tasks, ingest (enforces `max_upload_mb`, FIXPLAN 3.4), metrics,
+        API-key CRUD, search. Agent REST search via API key. Lifespan starts the ingest worker
+        (FIXPLAN 4.5). CORS from env.
+      - MCP tools (`list_documents`/`search_knowledge`/`retrieve_chunk`/`entity_lookup`) scoped
+        by org via a pure-ASGI `MCPAuthMiddleware` (API key → contextvar).
+      - Removed the dead SQLite modules: db.py, queue.py, mcp_server.py, cli.py (+ their tests).
+      *Verified* live: unauth 401 on REST + `/mcp`; admin endpoints org-scoped; agent API-key
+      search with cross-org isolation; bad key 401.
+      *Deferred:* full MCP SSE handshake needs a live client (M7).
 - [ ] **M7 — Deploy.** Dockerfile (tesseract-ocr-{hin,san}); deploy backend (Render) +
       frontend (Vercel); public bind; CORS locked to the Vercel domain; secrets via env.
       (This *inverts* FIXPLAN 2.1/2.4, which targeted loopback/localhost.)

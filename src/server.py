@@ -1,253 +1,321 @@
+"""
+OpenPDFSpecs — multi-tenant API + MCP server.
+
+All data access is org-scoped. Two authenticated surfaces:
+  * Admin dashboard   — Supabase user JWT (require_admin) → the caller's org.
+  * MCP / agents      — org API key `sk-pdfspecs-...` (require_api_key / MCP middleware).
+
+Everything runs on Postgres (pgdb), Supabase Storage (storage), the org-scoped worker
+(ingest), and hybrid search (search). The legacy SQLite modules are gone.
+"""
 import os
-import uuid
+import json
 import logging
 import threading
-import shutil
-from pathlib import Path
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, BackgroundTasks
+import contextvars
+from contextlib import asynccontextmanager
+from urllib.parse import parse_qs
+
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from mcp.server.fastmcp import FastMCP
 
-import src.db as db
-import src.queue as queue
+import src.pgdb as pgdb
+import src.auth as auth
+import src.storage as storage
+import src.ingest as ingest
+import src.search as search
 from src.config import get_config
-from src.mcp_server import mcp
 
-# Set up logs
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("pdfspecs.server")
 
-app = FastAPI(title="OpenPDFSpecs API & MCP Server")
 
-# Custom Authentication Middleware
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-            
-        path = request.url.path
-        method = request.method
-        
-        # Check if auth is required (disabled if no API keys exist, enabling first-run setup)
-        db.init_db()
-        auth_required = len(db.list_api_keys()) > 0
-        
-        is_mcp = path.startswith("/mcp")
-        is_api = path.startswith("/api/v1")
-        is_public = path == "/api/v1/config/provider" or (not auth_required)
-        
-        if (is_mcp or is_api) and not is_public:
-            # Check Authorization Header
-            auth_header = request.headers.get("Authorization")
-            token = None
-            if auth_header and auth_header.startswith("Bearer "):
-                token = auth_header.replace("Bearer ", "")
-            else:
-                # Check Query Parameter (useful for SSE connections)
-                token = request.query_params.get("token")
-                
-            if not token or not db.verify_api_key(token):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Unauthorized: Invalid or missing OpenPDFSpecs API key"}
-                )
-                
-        return await call_next(request)
+# ---------------------------------------------------------------------------
+# App + lifespan (starts the background ingestion worker)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pgdb.reset_stuck_tasks()
+    t = threading.Thread(target=ingest.run_worker_loop, daemon=True)
+    t.start()
+    logger.info("Background ingestion worker started.")
+    yield
+    pgdb.close_pool()
 
-app.add_middleware(AuthMiddleware)
 
-# Configure CORS so Next.js on port 3000 can talk to FastAPI on port 8000
+app = FastAPI(title="OpenPDFSpecs API & MCP Server", lifespan=lifespan)
+
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In development, allow all origins
-    allow_credentials=False,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mount the FastMCP SSE App under /mcp
-app.mount("/mcp", mcp.sse_app())
 
-@app.on_event("startup")
-def startup_event():
-    # 1. Initialize DB
-    db.init_db()
-    # 2. Reset stuck tasks from previous crash
-    queue.reset_stuck_tasks()
-    # 3. Start background worker thread
-    logger.info("Starting background ingestion worker thread...")
-    worker_thread = threading.Thread(target=queue.run_worker_loop, daemon=True)
-    worker_thread.start()
+# ---------------------------------------------------------------------------
+# Auth dependencies
+# ---------------------------------------------------------------------------
+def _bearer(authorization: str | None) -> str | None:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return None
 
-# REST Endpoints
-@app.get("/api/v1/config/provider")
-def get_public_provider_info():
-    """Returns provider status (needed by frontend to verify if setup is done)."""
-    db.init_db()
-    cfg = get_config()
-    # Re-load config from database
-    cfg.load()
-    
-    gemini_key = db.get_setting("gemini_api_key", decrypt=True)
-    nvidia_key = db.get_setting("nvidia_api_key", decrypt=True)
-    auth_required = len(db.list_api_keys()) > 0
-    
+
+def require_admin(authorization: str = Header(None)) -> dict:
+    """Verify a Supabase user JWT and resolve (bootstrapping) the caller's org."""
+    token = _bearer(authorization)
+    try:
+        return auth.authenticate_admin(token)
+    except auth.AuthError as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {e}")
+
+
+def require_api_key(authorization: str = Header(None)) -> str:
+    """Resolve an org API key to its org_id."""
+    org_id = auth.resolve_api_key(_bearer(authorization))
+    if not org_id:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key")
+    return org_id
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints (Supabase JWT)
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/me")
+def get_me(admin: dict = Depends(require_admin)):
+    return {"org_id": admin["org_id"], "email": admin["email"]}
+
+
+@app.get("/api/v1/config")
+def get_config_status(admin: dict = Depends(require_admin)):
+    org = admin["org_id"]
     return {
-        "provider": cfg.provider,
-        "has_gemini_key": bool(gemini_key),
-        "has_nvidia_key": bool(nvidia_key),
-        "llm_model": cfg.llm_model,
-        "embedding_model": cfg.embedding_model,
-        "chunk_size": cfg.chunk_size,
-        "chunk_overlap": cfg.chunk_overlap,
-        "auth_required": auth_required
+        "provider": pgdb.get_setting(org, "provider") or "gemini",
+        "has_gemini_key": bool(pgdb.get_setting(org, "gemini_api_key", decrypt=True)),
+        "has_nvidia_key": bool(pgdb.get_setting(org, "nvidia_api_key", decrypt=True)),
+        "llm_model": pgdb.get_setting(org, "llm_model") or "gemini-2.5-flash",
+        "embedding_model": pgdb.get_setting(org, "embedding_model") or "text-embedding-004",
     }
 
+
 @app.post("/api/v1/config")
-def save_system_config(payload: dict):
-    """Saves settings in the database (keys encrypted) and reloads config."""
-    db.init_db()
-    
-    provider = payload.get("provider")
-    if provider and provider in ["gemini", "nvidia"]:
-        db.save_setting("provider", provider)
-        
-    if "gemini_api_key" in payload:
-        db.save_setting("gemini_api_key", payload["gemini_api_key"], encrypt=True)
-        
-    if "nvidia_api_key" in payload:
-        db.save_setting("nvidia_api_key", payload["nvidia_api_key"], encrypt=True)
-        
-    if "llm_model" in payload:
-        db.save_setting("llm_model", payload["llm_model"])
-        
-    if "embedding_model" in payload:
-        db.save_setting("embedding_model", payload["embedding_model"])
-        
-    if "chunk_size" in payload:
-        db.save_setting("chunk_size", str(int(payload["chunk_size"])))
-        
-    if "chunk_overlap" in payload:
-        db.save_setting("chunk_overlap", str(int(payload["chunk_overlap"])))
-        
-    # Reload local config instance
-    get_config().load()
-    return {"status": "success", "message": "Settings updated successfully."}
+def save_config(payload: dict, admin: dict = Depends(require_admin)):
+    org = admin["org_id"]
+    if payload.get("provider") in ("gemini", "nvidia"):
+        pgdb.save_setting(org, "provider", payload["provider"])
+    for secret in ("gemini_api_key", "nvidia_api_key"):
+        if secret in payload and payload[secret]:
+            pgdb.save_setting(org, secret, payload[secret], encrypt=True)
+    for plain in ("llm_model", "embedding_model"):
+        if plain in payload:
+            pgdb.save_setting(org, plain, str(payload[plain]))
+    return {"status": "success"}
 
-@app.get("/api/v1/auth/tokens")
-def get_auth_tokens():
-    """Lists all active agent tokens."""
-    return db.list_api_keys()
-
-@app.post("/api/v1/auth/tokens")
-def generate_auth_token(payload: dict):
-    """Generates a new secure sk-pdfspecs-... API key."""
-    desc = payload.get("description", "Agent Access Key")
-    token = f"sk-pdfspecs-{uuid.uuid4()}"
-    db.add_api_key(token, desc)
-    return {"token": token, "description": desc}
-
-@app.delete("/api/v1/auth/tokens/{token}")
-def revoke_auth_token(token: str):
-    """Revokes an agent API key."""
-    db.delete_api_key(token)
-    return {"status": "success", "message": "API key revoked successfully."}
 
 @app.get("/api/v1/documents")
-def get_documents():
-    """Lists all cataloged documents."""
-    return db.list_documents()
+def list_documents(admin: dict = Depends(require_admin)):
+    return pgdb.list_documents(admin["org_id"])
+
 
 @app.delete("/api/v1/documents/{doc_id}")
-def delete_document(doc_id: str):
-    """Deletes an ingested document."""
-    db.delete_document(doc_id)
-    return {"status": "success", "message": "Document deleted successfully."}
+def delete_document(doc_id: str, admin: dict = Depends(require_admin)):
+    pgdb.delete_document(admin["org_id"], doc_id)
+    return {"status": "success"}
+
 
 @app.get("/api/v1/tasks")
-def get_tasks():
-    """Lists task queue statuses."""
-    return queue.list_tasks()
+def list_tasks(admin: dict = Depends(require_admin)):
+    return pgdb.list_tasks(admin["org_id"])
+
 
 @app.post("/api/v1/ingest")
-async def ingest_document(file: UploadFile = File(...)):
-    """Handles PDF upload and queues it for async background ingestion."""
-    # Ensure upload directory exists
-    upload_dir = Path.home() / ".pdfspecs" / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save the file locally
-    temp_path = upload_dir / f"{uuid.uuid4()}-{file.filename}"
+async def ingest_document(file: UploadFile = File(...), admin: dict = Depends(require_admin)):
+    org = admin["org_id"]
+    max_bytes = get_config().max_upload_mb * 1024 * 1024
+    data = await file.read()
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413,
+                            detail=f"File exceeds max upload size of {get_config().max_upload_mb} MB")
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
     try:
-        with temp_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        key = storage.upload_bytes(org, file.filename or "upload.pdf", data)
+        task_id = pgdb.add_task(org, key, file.filename)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
-        
-    # Add to SQLite task queue
-    try:
-        task_id = queue.add_task(str(temp_path))
-        return {
-            "status": "success",
-            "message": "File uploaded and queued for processing.",
-            "task_id": task_id,
-            "filename": file.filename
-        }
-    except Exception as e:
-        # Clean up temp file on failure
-        if temp_path.exists():
-            os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=f"Failed to queue ingestion task: {e}")
+        logger.exception("Ingest upload failed")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+    return {"status": "success", "task_id": task_id, "filename": file.filename}
+
 
 @app.get("/api/v1/metrics")
-def get_metrics():
-    """Returns token usage metrics for ingestion and sandbox."""
-    db.init_db()
-    return db.get_token_metrics()
+def metrics(admin: dict = Depends(require_admin)):
+    return pgdb.get_token_metrics(admin["org_id"])
 
+
+# --- Org API key management (admin) ---
+@app.get("/api/v1/keys")
+def list_keys(admin: dict = Depends(require_admin)):
+    # Never returns raw tokens — only hashes/descriptions.
+    return pgdb.list_api_keys(admin["org_id"])
+
+
+@app.post("/api/v1/keys")
+def create_key(payload: dict = None, admin: dict = Depends(require_admin)):
+    desc = (payload or {}).get("description", "Agent Access Key")
+    raw = auth.generate_api_key(admin["org_id"], desc)
+    # Raw token shown exactly once.
+    return {"token": raw, "description": desc}
+
+
+@app.delete("/api/v1/keys/{token_hash}")
+def revoke_key(token_hash: str, admin: dict = Depends(require_admin)):
+    pgdb.delete_api_key(admin["org_id"], token_hash)
+    return {"status": "success"}
+
+
+# --- Dashboard search (admin) ---
 @app.post("/api/v1/search")
-def search_documents(payload: dict):
-    """Exposes direct RAG search for external agents/LLMs, secured by API key."""
-    query = payload.get("query")
+def admin_search(payload: dict, admin: dict = Depends(require_admin)):
+    query = (payload or {}).get("query")
     if not query:
-        raise HTTPException(status_code=400, detail="Missing 'query' in request payload.")
-    limit = payload.get("limit", 5)
-    
-    from src.mcp_server import retrieve_chunks_for_query
-    import src.enricher as enricher
-    try:
-        chunks = retrieve_chunks_for_query(query, limit)
-        if not chunks:
-            raw_results = f"No matches found for search query: '{query}'."
-            synthesis = "No context found to synthesize an assessment."
-        else:
-            # Construct the markdown references list
-            output_parts = [f"# Search Results for: '{query}'", ""]
-            for idx, row in enumerate(chunks):
-                score = round(row["score"], 3)
-                output_parts.append(f"### {idx+1}. {row['filename']} (Pages {row['page_start']}-{row['page_end']})")
-                output_parts.append(f"- **Chunk ID**: `{row['id']}`")
-                output_parts.append(f"- **Relevance Score**: `{score}`")
-                output_parts.append(f"- **Summary**: {row['summary']}")
-                snippet = row['text_content'][:400].replace('\n', ' ')
-                output_parts.append(f"- **Text Snippet**: \"{snippet}...\"")
-                output_parts.append("")
-            raw_results = "\n".join(output_parts)
-            
-            # Generate RAG response (synthesis)
-            synthesis = enricher.generate_rag_response(query, chunks)
-            
-        return {
-            "results": raw_results,
-            "synthesis": synthesis
-        }
-    except Exception as e:
-        logger.exception(f"RAG search error: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+        raise HTTPException(status_code=400, detail="Missing 'query'")
+    limit = int((payload or {}).get("limit", 5))
+    return {"results": search.hybrid_search(admin["org_id"], query, limit)}
+
+
+# ---------------------------------------------------------------------------
+# Agent REST search (org API key) — a simple alternative to MCP for HTTP agents
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/agent/search")
+def agent_search(payload: dict, org_id: str = Depends(require_api_key)):
+    query = (payload or {}).get("query")
+    if not query:
+        raise HTTPException(status_code=400, detail="Missing 'query'")
+    limit = int((payload or {}).get("limit", 5))
+    return {"results": search.hybrid_search(org_id, query, limit)}
+
+
+# ---------------------------------------------------------------------------
+# MCP over HTTP — tools scoped to the org resolved from the request's API key
+# ---------------------------------------------------------------------------
+_current_org: contextvars.ContextVar = contextvars.ContextVar("current_org", default=None)
+
+
+def _mcp_org() -> str:
+    org = _current_org.get()
+    if not org:
+        raise RuntimeError("No authenticated org in context.")
+    return org
+
+
+mcp = FastMCP("OpenPDFSpecs")
+
+
+@mcp.tool()
+def list_documents_tool() -> str:
+    """List all indexed documents available in this knowledgebase."""
+    docs = pgdb.list_documents(_mcp_org())
+    if not docs:
+        return "No documents have been indexed yet."
+    lines = ["# Documents", "", "| ID | Filename | Size (KB) | Ingested |", "|---|---|---|---|"]
+    for d in docs:
+        lines.append(f"| `{d['id']}` | {d['filename']} | {round(d['size_bytes']/1024,1)} | {d['created_at']} |")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def search_knowledge(query: str, limit: int = 5) -> str:
+    """Hybrid (lexical + semantic) search over the knowledgebase. Returns matching chunks."""
+    rows = search.hybrid_search(_mcp_org(), query, limit)
+    if not rows:
+        return f"No matches for: '{query}'."
+    out = [f"# Search Results for: '{query}'", ""]
+    for i, r in enumerate(rows):
+        snippet = (r["text_content"] or "")[:400].replace("\n", " ")
+        out += [f"### {i+1}. {r['filename']} (pages {r['page_start']}-{r['page_end']})",
+                f"- Chunk ID: `{r['id']}`",
+                f"- Score: {round(r['score'],4)}",
+                f"- Summary: {r.get('summary','')}",
+                f"- Snippet: \"{snippet}...\"", ""]
+    return "\n".join(out)
+
+
+@mcp.tool()
+def retrieve_chunk(chunk_id: str) -> str:
+    """Retrieve the full text of a chunk by its ID."""
+    row = pgdb.get_chunk(_mcp_org(), chunk_id)
+    if not row:
+        return f"Chunk `{chunk_id}` not found."
+    return "\n".join([f"# {row['filename']}",
+                      f"Pages {row['page_start']}-{row['page_end']}", "",
+                      "## Summary", row.get("summary") or "", "",
+                      "## Content", "```text", row["text_content"], "```"])
+
+
+@mcp.tool()
+def entity_lookup(entity_name: str) -> str:
+    """Find chunks/documents associated with an entity, concept, or term."""
+    rows = pgdb.entity_lookup(_mcp_org(), entity_name)
+    if not rows:
+        return f"No occurrences found for entity: '{entity_name}'."
+    out = [f"# Occurrences of '{entity_name}'", "",
+           "| Document | Pages | Entity (Type) | Chunk |", "|---|---|---|---|"]
+    for r in rows:
+        summ = (r.get("summary") or "")[:60].replace("\n", " ")
+        out.append(f"| {r['filename']} | {r['page_start']}-{r['page_end']} | "
+                   f"{r['entity_name']} ({r['entity_type']}) | `{r['chunk_id']}`: {summ}... |")
+    return "\n".join(out)
+
+
+class MCPAuthMiddleware:
+    """Pure-ASGI middleware: authenticate the org API key and bind org_id to the context.
+
+    Reads the key from `Authorization: Bearer` or a `?token=` query param (SSE-friendly).
+    Rejects with 401 when missing/invalid. Runs in the same task as the wrapped app so the
+    contextvar propagates to tool execution.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+        token = _bearer(headers.get("authorization"))
+        if not token:
+            qs = parse_qs(scope.get("query_string", b"").decode())
+            token = (qs.get("token") or [None])[0]
+        org_id = auth.resolve_api_key(token) if token else None
+        if not org_id:
+            resp = JSONResponse({"detail": "Unauthorized: invalid or missing API key"}, status_code=401)
+            return await resp(scope, receive, send)
+        tok = _current_org.set(org_id)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_org.reset(tok)
+
+
+app.mount("/mcp", MCPAuthMiddleware(mcp.sse_app()))
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.server:app", host="0.0.0.0", port=8000, reload=True, reload_dirs=["src"])
-
-
-
+    uvicorn.run("src.server:app",
+                host=os.getenv("HOST", "127.0.0.1"),
+                port=int(os.getenv("PORT", "8000")),
+                reload=False)
