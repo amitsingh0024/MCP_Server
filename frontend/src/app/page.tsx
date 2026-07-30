@@ -265,13 +265,15 @@ function DocumentsPanel() {
         ) : (
           <div className="grid gap-3">
             {tasks.map(t => {
-              const pct = t.total_chunks ? Math.round((t.processed_chunks / t.total_chunks) * 100) : 0;
+              const p = (function() { try { return JSON.parse(t.progress_info || "{}"); } catch { return {}; } })();
+              const pct = p.progress != null ? Math.round(p.progress * 100) : 0;
+              const statusMsg = p.status || t.status;
               return (
                 <Card key={t.id} className="p-4 flex flex-col gap-3">
                   <div className="flex justify-between items-start">
                     <div>
-                      <div className="text-sm text-zinc-300 font-medium">{t.filename}</div>
-                      <div className="text-xs text-zinc-500 mt-0.5 truncate max-w-md">{t.status_msg || "Processing..."}</div>
+                      <div className="text-sm text-zinc-300 font-medium">{t.original_filename || `task #${t.id}`}</div>
+                      <div className="text-xs text-zinc-500 mt-0.5 truncate max-w-md">{statusMsg}</div>
                     </div>
                     <div className="text-xs font-mono text-zinc-500">
                       {t.status === 'processing' ? (
