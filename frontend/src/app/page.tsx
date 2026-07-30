@@ -237,8 +237,8 @@ function DocumentsPanel() {
     async function load() {
       try {
         const [docsData, tasksData] = await Promise.all([
-          apiFetch("/api/v1/documents"),
-          apiFetch("/api/v1/tasks")
+          apiFetch<any[]>("/api/v1/documents"),
+          apiFetch<any[]>("/api/v1/tasks")
         ]);
         setDocs(docsData);
         setTasks(tasksData);
