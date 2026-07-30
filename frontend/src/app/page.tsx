@@ -436,7 +436,7 @@ function SearchPanel() {
         <input
           type="text"
           value={q}
-          onChange={e => setQ(e.target.value)}
+          onChange={(e: any) => setQ(e.target.value)}
           placeholder="Semantic search across knowledge base..."
           className="w-full bg-[#0a0a0a] border border-zinc-800 text-zinc-100 rounded-lg pl-10 pr-4 py-3 text-sm focus:border-zinc-500 focus:outline-none transition-colors"
         />
@@ -479,7 +479,7 @@ function KeysPanel() {
 
   async function loadKeys() {
     try {
-      const data = await apiFetch("/api/v1/keys");
+      const data = await apiFetch<any[]>("/api/v1/keys");
       setKeys(data);
     } catch (e) { console.error(e); }
   }
@@ -525,7 +525,7 @@ function KeysPanel() {
       <form onSubmit={generateKey} className="flex gap-3">
         <Input 
           placeholder="Key name (e.g., 'Claude Desktop')" 
-          value={name} onChange={e => setName(e.target.value)}
+          value={name} onChange={(e: any) => setName(e.target.value)}
           className="max-w-xs"
         />
         <Button type="submit" disabled={loading || !name.trim()}>Generate</Button>
@@ -657,12 +657,12 @@ function SettingsPanel({ config, onSave }: any) {
           {provider === 'gemini' ? (
             <div className="space-y-2">
               <label className="text-xs text-zinc-500">Update Gemini API Key</label>
-              <Input type="password" value={geminiKey} onChange={e => setGeminiKey(e.target.value)} placeholder="AIzaSy..." />
+              <Input type="password" value={geminiKey} onChange={(e: any) => setGeminiKey(e.target.value)} placeholder="AIzaSy..." />
             </div>
           ) : (
             <div className="space-y-2">
               <label className="text-xs text-zinc-500">Update Nvidia API Key</label>
-              <Input type="password" value={nvidiaKey} onChange={e => setNvidiaKey(e.target.value)} placeholder="nvapi-..." />
+              <Input type="password" value={nvidiaKey} onChange={(e: any) => setNvidiaKey(e.target.value)} placeholder="nvapi-..." />
             </div>
           )}
         </div>
