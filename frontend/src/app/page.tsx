@@ -1,492 +1,679 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabase";
-import { apiFetch, API_BASE } from "@/lib/api";
+import { useEffect, useState, FormEvent } from "react";
+import ReactMarkdown from 'react-markdown';
 
-/* ---------------------------------- types --------------------------------- */
-interface DocRow {
-  id: string;
-  filename: string;
-  size_bytes: number;
-  created_at: string;
-}
-interface TaskRow {
-  id: number;
-  original_filename: string | null;
-  status: "pending" | "processing" | "completed" | "failed";
-  attempts: number;
-  error_message: string | null;
-  progress_info: string | null;
-}
-interface KeyRow {
-  token_hash: string;
-  description: string;
-  created_at: string;
-}
-interface ConfigStatus {
-  provider: string;
-  has_gemini_key: boolean;
-  has_nvidia_key: boolean;
-  llm_model: string;
-  embedding_model: string;
-}
-interface SearchHit {
-  id: string;
-  filename: string;
-  page_start: number;
-  page_end: number;
-  score: number;
-  summary: string;
-  text_content: string;
-}
-interface Metrics {
-  ingestion: { prompt: number; completion: number; total: number };
-  sandbox: { prompt: number; completion: number; total: number };
-}
+// --- Minimalist SVG Icons ---
+const Icons = {
+  Book: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+    </svg>
+  ),
+  Upload: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+    </svg>
+  ),
+  Search: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+    </svg>
+  ),
+  Key: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+    </svg>
+  ),
+  Settings: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+    </svg>
+  ),
+  Check: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+    </svg>
+  ),
+  Copy: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+    </svg>
+  ),
+  Alert: () => (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+    </svg>
+  ),
+  Loader: () => (
+    <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+    </svg>
+  )
+};
 
-/* ------------------------------- UI helpers ------------------------------- */
-function Card({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
+// --- Minimalist Components ---
+const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`bg-[#0a0a0a] border border-zinc-800 rounded-lg overflow-hidden ${className}`}>
+    {children}
+  </div>
+);
+
+const Button = ({ children, onClick, type = "button", variant = "primary", className = "", disabled = false }: any) => {
+  const variants = {
+    primary: "bg-white text-black hover:bg-zinc-200 active:scale-[0.98]",
+    secondary: "bg-zinc-900 text-zinc-300 border border-zinc-800 hover:bg-zinc-800 active:scale-[0.98]",
+    ghost: "bg-transparent text-zinc-400 hover:text-white hover:bg-zinc-900 active:scale-[0.98]",
+    danger: "bg-transparent text-red-500 hover:bg-red-500/10 active:scale-[0.98]"
+  };
   return (
-    <section className="rounded-2xl border border-white/10 bg-white/[0.02] p-6 shadow-xl">
-      {title && <h2 className="text-sm font-semibold tracking-wide text-indigo-300">{title}</h2>}
-      {subtitle && <p className="mt-1 text-xs text-gray-500">{subtitle}</p>}
-      <div className={title ? "mt-4" : ""}>{children}</div>
-    </section>
-  );
-}
-
-function Button({
-  children, onClick, disabled, variant = "primary", type = "button",
-}: {
-  children: React.ReactNode; onClick?: () => void; disabled?: boolean;
-  variant?: "primary" | "ghost" | "danger"; type?: "button" | "submit";
-}) {
-  const styles = {
-    primary: "bg-indigo-600 hover:bg-indigo-500 text-white",
-    ghost: "border border-white/15 hover:bg-white/5 text-gray-200",
-    danger: "border border-red-500/30 text-red-300 hover:bg-red-500/10",
-  }[variant];
-  return (
-    <button type={type} onClick={onClick} disabled={disabled}
-      className={`rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-40 disabled:cursor-not-allowed ${styles}`}>
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={`px-4 py-2 text-sm font-medium rounded-md transition-all duration-200 ease-out flex items-center justify-center gap-2 ${variants[variant as keyof typeof variants]} ${disabled ? "opacity-50 cursor-not-allowed" : ""} ${className}`}
+    >
       {children}
     </button>
   );
-}
+};
 
-function useCopy() {
-  const [copied, setCopied] = useState<string | null>(null);
-  const copy = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 1500);
-  };
-  return { copied, copy };
-}
+const Input = ({ ...props }) => (
+  <input
+    {...props}
+    className={`w-full bg-transparent border border-zinc-800 text-zinc-100 placeholder-zinc-600 rounded-md px-3 py-2 text-sm focus:border-zinc-500 focus:outline-none transition-colors ${props.className || ""}`}
+  />
+);
 
-const fmtKB = (b: number) => `${(b / 1024).toFixed(1)} KB`;
+const Select = ({ children, ...props }: any) => (
+  <select
+    {...props}
+    className={`w-full bg-[#0a0a0a] border border-zinc-800 text-zinc-100 rounded-md px-3 py-2 text-sm focus:border-zinc-500 focus:outline-none transition-colors appearance-none ${props.className || ""}`}
+  >
+    {children}
+  </select>
+);
 
-/* ------------------------------- login view ------------------------------- */
-function LoginScreen() {
-  const [busy, setBusy] = useState(false);
-  const signIn = async () => {
-    setBusy(true);
+// --- Environment configuration ---
+import { supabase } from "@/lib/supabase";
+import { apiFetch, API_BASE } from "@/lib/api";
+
+export default function Home() {
+  const [session, setSession] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState("documents");
+
+  // Global state
+  const [config, setConfig] = useState<any>({});
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (session) {
+      loadConfig();
+    }
+  }, [session]);
+
+  async function loadConfig() {
+    try {
+      const data = await apiFetch("/api/v1/config");
+      setConfig(data);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function handleLogin() {
+    setAuthLoading(true);
     await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: window.location.origin },
     });
-  };
-  return (
-    <div className="flex min-h-screen items-center justify-center p-6">
-      <div className="w-full max-w-md rounded-2xl border border-white/10 bg-white/[0.02] p-8 text-center shadow-2xl">
-        <div className="mx-auto mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600/20 text-2xl">📚</div>
-        <h1 className="text-xl font-semibold">OpenPDFSpecs</h1>
-        <p className="mt-2 text-sm text-gray-400">
-          Multi-tenant PDF knowledgebase over MCP. Sign in to manage your organization&apos;s
-          documents and API keys.
-        </p>
-        <div className="mt-6">
-          <Button onClick={signIn} disabled={busy}>
-            {busy ? "Redirecting…" : "Sign in with Google"}
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+  }
+
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center p-6">
+        <Card className="w-full max-w-sm p-8 text-center flex flex-col gap-6">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-zinc-900 border border-zinc-800 text-2xl">📚</div>
+          <div className="space-y-1">
+            <h1 className="text-xl font-medium text-white">OpenPDFSpecs</h1>
+            <p className="text-sm text-zinc-500">
+              Multi-tenant PDF knowledgebase over MCP. Sign in to manage your organization's documents and API keys.
+            </p>
+          </div>
+          <Button onClick={handleLogin} disabled={authLoading} className="w-full py-2.5">
+            {authLoading ? "Redirecting..." : "Sign in with Google"}
           </Button>
-        </div>
-        <p className="mt-6 text-[11px] text-gray-600">
-          One Google account = one organization. Your data is isolated by API key.
-        </p>
+          <p className="text-[11px] text-zinc-600">
+            One Google account = one organization. Your data is isolated by API key.
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
+  const tabs = [
+    { id: "documents", label: "Documents", icon: <Icons.Book /> },
+    { id: "ingest", label: "Ingest", icon: <Icons.Upload /> },
+    { id: "search", label: "Search", icon: <Icons.Search /> },
+    { id: "keys", label: "API Keys", icon: <Icons.Key /> },
+    { id: "settings", label: "Settings", icon: <Icons.Settings /> },
+  ];
+
+  return (
+    <div className="min-h-screen bg-black text-zinc-300 font-sans selection:bg-zinc-800">
+      <div className="max-w-5xl mx-auto px-6 py-12">
+        {/* Header */}
+        <header className="flex items-center justify-between mb-12">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center">
+              <div className="w-4 h-4 bg-black rounded-sm"></div>
+            </div>
+            <div>
+              <h1 className="text-lg font-medium text-white leading-tight">OpenPDFSpecs</h1>
+              <p className="text-xs text-zinc-500">{session.user.email}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-6 text-sm">
+            <Button variant="ghost" onClick={handleLogout} className="!px-2 !py-1 text-xs">Sign out</Button>
+          </div>
+        </header>
+
+        {/* Navigation */}
+        <nav className="flex gap-1 mb-8 border-b border-zinc-900 pb-px">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex items-center gap-2 px-4 py-2 text-sm transition-colors ${
+                activeTab === tab.id 
+                  ? "text-white border-b border-white" 
+                  : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
+        {/* Content Area */}
+        <main className="animate-in fade-in duration-300">
+          {activeTab === "documents" && <DocumentsPanel />}
+          {activeTab === "ingest" && <IngestPanel onIngest={() => {}} />}
+          {activeTab === "search" && <SearchPanel />}
+          {activeTab === "keys" && <KeysPanel />}
+          {activeTab === "settings" && <SettingsPanel config={config} onSave={() => loadConfig()} />}
+        </main>
       </div>
     </div>
   );
 }
 
-/* ------------------------------- panels ----------------------------------- */
-function SettingsPanel({ onSaved }: { onSaved: () => void }) {
-  const [cfg, setCfg] = useState<ConfigStatus | null>(null);
-  const [provider, setProvider] = useState("gemini");
-  const [geminiKey, setGeminiKey] = useState("");
-  const [nvidiaKey, setNvidiaKey] = useState("");
-  const [msg, setMsg] = useState("");
-  const [busy, setBusy] = useState(false);
+// ------------------------------------------------------------------
+// Panels
+// ------------------------------------------------------------------
 
-  const load = useCallback(async () => {
-    try {
-      const c = await apiFetch<ConfigStatus>("/api/v1/config");
-      setCfg(c);
-      setProvider(c.provider);
-    } catch (e) { setMsg((e as Error).message); }
-  }, []);
-  useEffect(() => { load(); }, [load]);
+function DocumentsPanel() {
+  const [docs, setDocs] = useState<any[]>([]);
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const save = async () => {
-    setBusy(true); setMsg("");
-    try {
-      const payload: Record<string, string> = { provider };
-      if (geminiKey) payload.gemini_api_key = geminiKey;
-      if (nvidiaKey) payload.nvidia_api_key = nvidiaKey;
-      await apiFetch("/api/v1/config", { method: "POST", body: JSON.stringify(payload) });
-      setGeminiKey(""); setNvidiaKey(""); setMsg("Saved.");
-      await load(); onSaved();
-    } catch (e) { setMsg((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <Card title="Provider settings (bring your own key)"
-      subtitle="Your key is encrypted at rest and used only for your org's ingestion & search.">
-      <div className="space-y-4">
-        <div>
-          <label className="text-xs text-gray-400">Provider</label>
-          <select value={provider} onChange={(e) => setProvider(e.target.value)}
-            className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm">
-            <option value="gemini">Google Gemini</option>
-            <option value="nvidia">NVIDIA NIM</option>
-          </select>
-        </div>
-        <div>
-          <label className="text-xs text-gray-400">
-            Gemini API key {cfg?.has_gemini_key && <span className="text-emerald-400">• configured</span>}
-          </label>
-          <input type="password" value={geminiKey} onChange={(e) => setGeminiKey(e.target.value)}
-            placeholder={cfg?.has_gemini_key ? "•••••••• (leave blank to keep)" : "Enter key"}
-            className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm" />
-        </div>
-        <div>
-          <label className="text-xs text-gray-400">
-            NVIDIA API key {cfg?.has_nvidia_key && <span className="text-emerald-400">• configured</span>}
-          </label>
-          <input type="password" value={nvidiaKey} onChange={(e) => setNvidiaKey(e.target.value)}
-            placeholder={cfg?.has_nvidia_key ? "•••••••• (leave blank to keep)" : "Enter key"}
-            className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm" />
-        </div>
-        <p className="text-[11px] text-gray-500">
-          Note: embeddings use Gemini <code>text-embedding-004</code> platform-wide, so a Gemini key is
-          recommended for semantic search.
-        </p>
-        <div className="flex items-center gap-3">
-          <Button onClick={save} disabled={busy}>{busy ? "Saving…" : "Save settings"}</Button>
-          {msg && <span className="text-xs text-gray-400">{msg}</span>}
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-function IngestPanel({ onQueued }: { onQueued: () => void }) {
-  const [file, setFile] = useState<File | null>(null);
-  const [msg, setMsg] = useState("");
-  const [busy, setBusy] = useState(false);
-  const upload = async () => {
-    if (!file) return;
-    setBusy(true); setMsg("");
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const r = await apiFetch<{ task_id: number }>("/api/v1/ingest", { method: "POST", body: fd });
-      setMsg(`Queued for processing (task #${r.task_id}).`);
-      setFile(null); onQueued();
-    } catch (e) { setMsg((e as Error).message); }
-    finally { setBusy(false); }
-  };
-  return (
-    <Card title="Ingest a PDF" subtitle="Uploads to your org's private storage and queues background processing.">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-        <input type="file" accept="application/pdf"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          className="text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-indigo-600 file:px-3 file:py-2 file:text-white" />
-        <Button onClick={upload} disabled={!file || busy}>{busy ? "Uploading…" : "Upload & ingest"}</Button>
-      </div>
-      {msg && <p className="mt-3 text-xs text-gray-400">{msg}</p>}
-    </Card>
-  );
-}
-
-function DocumentsPanel({ refreshKey }: { refreshKey: number }) {
-  const [docs, setDocs] = useState<DocRow[]>([]);
-  const [tasks, setTasks] = useState<TaskRow[]>([]);
-  const [err, setErr] = useState("");
-
-  const load = useCallback(async () => {
-    try {
-      const [d, t] = await Promise.all([
-        apiFetch<DocRow[]>("/api/v1/documents"),
-        apiFetch<TaskRow[]>("/api/v1/tasks"),
-      ]);
-      setDocs(d); setTasks(t);
-    } catch (e) { setErr((e as Error).message); }
-  }, []);
-  useEffect(() => { load(); }, [load, refreshKey]);
-  // Poll while anything is in flight.
   useEffect(() => {
-    const active = tasks.some((t) => t.status === "pending" || t.status === "processing");
-    if (!active) return;
-    const id = setInterval(load, 3000);
-    return () => clearInterval(id);
-  }, [tasks, load]);
-
-  const del = async (id: string) => {
-    await apiFetch(`/api/v1/documents/${id}`, { method: "DELETE" });
+    async function load() {
+      try {
+        const [docsData, tasksData] = await Promise.all([
+          apiFetch("/api/v1/documents"),
+          apiFetch("/api/v1/tasks")
+        ]);
+        setDocs(docsData);
+        setTasks(tasksData);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoading(false);
+      }
+    }
     load();
-  };
-  const progressOf = (t: TaskRow): { progress?: number } => {
-    try { return JSON.parse(t.progress_info || "{}"); } catch { return {}; }
-  };
-  const statusColor: Record<TaskRow["status"], string> = {
-    completed: "text-emerald-400", failed: "text-red-400",
-    processing: "text-indigo-300", pending: "text-gray-400",
-  };
+    const int = setInterval(load, 5000);
+    return () => clearInterval(int);
+  }, []);
 
   return (
-    <div className="space-y-6">
-      <Card title="Queue" subtitle="Background ingestion status.">
-        {tasks.length === 0 ? <p className="text-sm text-gray-500">No tasks yet.</p> : (
-          <ul className="space-y-2">
-            {tasks.slice(0, 8).map((t) => {
-              const p = progressOf(t);
+    <div className="space-y-8">
+      {/* Active Tasks */}
+      <section className="space-y-4">
+        <h2 className="text-sm font-medium text-white flex items-center gap-2">
+          Ingestion Queue {tasks.length > 0 && <span className="text-xs bg-zinc-900 px-2 py-0.5 rounded text-zinc-400">{tasks.length}</span>}
+        </h2>
+        {tasks.length === 0 ? (
+          <p className="text-sm text-zinc-600">No active tasks in queue.</p>
+        ) : (
+          <div className="grid gap-3">
+            {tasks.map(t => {
+              const pct = t.total_chunks ? Math.round((t.processed_chunks / t.total_chunks) * 100) : 0;
               return (
-                <li key={t.id} className="flex items-center justify-between rounded-lg border border-white/5 bg-black/20 px-3 py-2 text-sm">
-                  <span className="truncate">{t.original_filename || `task #${t.id}`}</span>
-                  <span className="ml-3 flex items-center gap-2 text-xs">
-                    <span className={statusColor[t.status]}>{t.status}</span>
-                    {(t.status === "processing" || t.status === "pending") && p.progress != null &&
-                      <span className="text-gray-500">{p.progress}%</span>}
-                  </span>
-                </li>
+                <Card key={t.id} className="p-4 flex flex-col gap-3">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <div className="text-sm text-zinc-300 font-medium">{t.filename}</div>
+                      <div className="text-xs text-zinc-500 mt-0.5 truncate max-w-md">{t.status_msg || "Processing..."}</div>
+                    </div>
+                    <div className="text-xs font-mono text-zinc-500">
+                      {t.status === 'processing' ? (
+                        <span className="flex items-center gap-1.5 text-zinc-300"><Icons.Loader /> {pct}%</span>
+                      ) : t.status === 'error' ? (
+                        <span className="flex items-center gap-1.5 text-red-500"><Icons.Alert /> Error</span>
+                      ) : (
+                        <span className="flex items-center gap-1.5 text-zinc-500">{t.status}</span>
+                      )}
+                    </div>
+                  </div>
+                  {t.status === 'processing' && (
+                    <div className="w-full bg-zinc-900 h-1 rounded-full overflow-hidden">
+                      <div className="bg-zinc-500 h-full transition-all duration-500" style={{ width: `${pct}%` }}></div>
+                    </div>
+                  )}
+                </Card>
               );
             })}
-          </ul>
+          </div>
         )}
-      </Card>
+      </section>
 
-      <Card title={`Documents (${docs.length})`}>
-        {err && <p className="text-xs text-red-400">{err}</p>}
-        {docs.length === 0 ? <p className="text-sm text-gray-500">No documents indexed yet.</p> : (
+      {/* Catalog */}
+      <section className="space-y-4">
+        <h2 className="text-sm font-medium text-white">Knowledge Base</h2>
+        <Card>
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="text-xs text-gray-500">
-                <tr><th className="py-2">Filename</th><th>Size</th><th>Ingested</th><th></th></tr>
+            <table className="w-full text-left text-sm text-zinc-400">
+              <thead className="text-xs text-zinc-500 border-b border-zinc-900">
+                <tr>
+                  <th className="px-4 py-3 font-medium">Filename</th>
+                  <th className="px-4 py-3 font-medium">Chunks</th>
+                  <th className="px-4 py-3 font-medium">Ingested At</th>
+                </tr>
               </thead>
-              <tbody>
-                {docs.map((d) => (
-                  <tr key={d.id} className="border-t border-white/5">
-                    <td className="py-2 pr-4">{d.filename}</td>
-                    <td className="pr-4 text-gray-400">{fmtKB(d.size_bytes)}</td>
-                    <td className="pr-4 text-gray-500">{new Date(d.created_at).toLocaleString()}</td>
-                    <td><button onClick={() => del(d.id)} className="text-xs text-red-400 hover:underline">delete</button></td>
+              <tbody className="divide-y divide-zinc-900">
+                {docs.length === 0 && (
+                  <tr><td colSpan={3} className="px-4 py-8 text-center text-zinc-600">No documents cataloged.</td></tr>
+                )}
+                {docs.map(d => (
+                  <tr key={d.id} className="hover:bg-zinc-900/50 transition-colors">
+                    <td className="px-4 py-3 font-medium text-zinc-300">{d.filename}</td>
+                    <td className="px-4 py-3">{d.chunk_count}</td>
+                    <td className="px-4 py-3 font-mono text-xs">{new Date(d.created_at).toLocaleString()}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        )}
-      </Card>
+        </Card>
+      </section>
+    </div>
+  );
+}
+
+function IngestPanel({ onIngest }: { onIngest: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function handleUpload(e: FormEvent) {
+    e.preventDefault();
+    if (!file) return;
+    setUploading(true);
+    setMsg("");
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await apiFetch("/api/v1/ingest", {
+        method: "POST",
+        body: formData
+      });
+      setMsg("Task queued successfully.");
+      setFile(null);
+      onIngest();
+    } catch (err: any) {
+      setMsg(`Error: ${err.message}`);
+    }
+    setUploading(false);
+  }
+
+  return (
+    <div className="max-w-xl">
+      <div className="mb-6 space-y-1">
+        <h2 className="text-base font-medium text-white">Ingest Document</h2>
+        <p className="text-sm text-zinc-500">Upload a PDF to parse, chunk, and embed into the graph.</p>
+      </div>
+      
+      <form onSubmit={handleUpload} className="space-y-6">
+        <div className="relative group">
+          <input 
+            type="file" 
+            accept=".pdf" 
+            onChange={(e) => setFile(e.target.files?.[0] || null)} 
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
+          />
+          <div className={`border border-dashed rounded-lg p-12 text-center transition-colors ${file ? "border-zinc-500 bg-zinc-900" : "border-zinc-800 hover:border-zinc-600 bg-[#0a0a0a]"}`}>
+            <div className="flex flex-col items-center gap-3">
+              <div className={`p-3 rounded-full ${file ? "bg-white text-black" : "bg-zinc-900 text-zinc-500 group-hover:text-zinc-300"}`}>
+                <Icons.Upload />
+              </div>
+              {file ? (
+                <div>
+                  <div className="text-sm text-white font-medium">{file.name}</div>
+                  <div className="text-xs text-zinc-500 mt-1">{(file.size / 1024 / 1024).toFixed(2)} MB</div>
+                </div>
+              ) : (
+                <div>
+                  <div className="text-sm font-medium text-zinc-300">Click or drag PDF here</div>
+                  <div className="text-xs text-zinc-500 mt-1">Up to 50MB per file</div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <Button type="submit" disabled={!file || uploading}>
+            {uploading ? "Queuing..." : "Process Document"}
+          </Button>
+          {msg && (
+            <span className={`text-sm ${msg.startsWith("Error") ? "text-red-500" : "text-zinc-400"}`}>
+              {msg}
+            </span>
+          )}
+        </div>
+      </form>
     </div>
   );
 }
 
 function SearchPanel() {
   const [q, setQ] = useState("");
-  const [hits, setHits] = useState<SearchHit[] | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const run = async () => {
+  const [results, setResults] = useState<any[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  async function handleSearch(e: FormEvent) {
+    e.preventDefault();
     if (!q.trim()) return;
-    setBusy(true); setErr(""); setHits(null);
+    setSearching(true);
     try {
-      const r = await apiFetch<{ results: SearchHit[] }>("/api/v1/search", {
-        method: "POST", body: JSON.stringify({ query: q, limit: 8 }),
+      const data: any = await apiFetch("/api/v1/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, limit: 5 })
       });
-      setHits(r.results);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
+      setResults(data.results || []);
+    } catch (e) {
+      console.error(e);
+    }
+    setSearching(false);
+  }
+
   return (
-    <Card title="Search your knowledgebase" subtitle="Hybrid lexical + semantic (RRF).">
-      <div className="flex gap-2">
-        <input value={q} onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && run()}
-          placeholder="e.g. treatment for fever"
-          className="flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm" />
-        <Button onClick={run} disabled={busy}>{busy ? "Searching…" : "Search"}</Button>
+    <div className="space-y-6">
+      <form onSubmit={handleSearch} className="relative max-w-2xl">
+        <Icons.Search />
+        <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500">
+          <Icons.Search />
+        </div>
+        <input
+          type="text"
+          value={q}
+          onChange={e => setQ(e.target.value)}
+          placeholder="Semantic search across knowledge base..."
+          className="w-full bg-[#0a0a0a] border border-zinc-800 text-zinc-100 rounded-lg pl-10 pr-4 py-3 text-sm focus:border-zinc-500 focus:outline-none transition-colors"
+        />
+        <Button type="submit" variant="ghost" disabled={searching} className="absolute right-1 top-1 !px-3 !py-2 text-xs">
+          {searching ? "Searching..." : "Search"}
+        </Button>
+      </form>
+
+      <div className="grid gap-4 max-w-4xl">
+        {results.map((r, i) => (
+          <Card key={i} className="p-5 flex flex-col gap-3 group hover:border-zinc-700 transition-colors">
+            <div className="flex items-center gap-2">
+              <span className="text-xs bg-zinc-900 text-zinc-400 px-2 py-0.5 rounded border border-zinc-800">Score: {r.score.toFixed(3)}</span>
+              <span className="text-xs font-medium text-zinc-300">{r.filename}</span>
+              <span className="text-xs text-zinc-600">p. {r.page_num}</span>
+            </div>
+            <div className="text-sm leading-relaxed text-zinc-300 prose prose-invert max-w-none">
+              <ReactMarkdown>{r.text_content}</ReactMarkdown>
+            </div>
+          </Card>
+        ))}
+        {results.length === 0 && q && !searching && (
+          <div className="text-sm text-zinc-600">No semantic matches found.</div>
+        )}
       </div>
-      {err && <p className="mt-3 text-xs text-red-400">{err}</p>}
-      {hits && hits.length === 0 && <p className="mt-4 text-sm text-gray-500">No matches.</p>}
-      {hits && hits.length > 0 && (
-        <ul className="mt-4 space-y-3">
-          {hits.map((h, i) => (
-            <li key={h.id} className="rounded-lg border border-white/5 bg-black/20 p-4">
-              <div className="flex items-center justify-between text-xs text-gray-500">
-                <span>{i + 1}. {h.filename} · pages {h.page_start}–{h.page_end}</span>
-                <span>score {h.score.toFixed(4)}</span>
-              </div>
-              {h.summary && <p className="mt-1 text-sm text-indigo-200">{h.summary}</p>}
-              <p className="mt-1 text-xs text-gray-400 line-clamp-3">{h.text_content?.slice(0, 300)}…</p>
-            </li>
-          ))}
-        </ul>
-      )}
-    </Card>
+    </div>
   );
 }
 
 function KeysPanel() {
-  const [keys, setKeys] = useState<KeyRow[]>([]);
-  const [fresh, setFresh] = useState<string | null>(null);
-  const [desc, setDesc] = useState("");
-  const { copied, copy } = useCopy();
-
-  const load = useCallback(async () => {
-    setKeys(await apiFetch<KeyRow[]>("/api/v1/keys"));
-  }, []);
-  useEffect(() => { load(); }, [load]);
-
-  const gen = async () => {
-    const r = await apiFetch<{ token: string }>("/api/v1/keys", {
-      method: "POST", body: JSON.stringify({ description: desc || "Agent Access Key" }),
-    });
-    setFresh(r.token); setDesc(""); load();
-  };
-  const revoke = async (hash: string) => {
-    await apiFetch(`/api/v1/keys/${hash}`, { method: "DELETE" });
-    load();
-  };
-  const mcpUrl = fresh ? `${API_BASE}/mcp?token=${fresh}` : "";
-
-  return (
-    <div className="space-y-6">
-      <Card title="API keys" subtitle="Give these to colleagues / MCP clients. They scope access to THIS org only.">
-        <div className="flex gap-2">
-          <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="Description (e.g. Amit's Cursor)"
-            className="flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm" />
-          <Button onClick={gen}>Generate key</Button>
-        </div>
-
-        {fresh && (
-          <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
-            <p className="text-xs text-amber-300">Copy this now — it is shown only once.</p>
-            <div className="mt-2 flex items-center gap-2">
-              <code className="flex-1 truncate rounded bg-black/40 px-3 py-2 text-xs">{fresh}</code>
-              <Button variant="ghost" onClick={() => copy(fresh, "key")}>{copied === "key" ? "Copied" : "Copy"}</Button>
-            </div>
-            <p className="mt-3 text-xs text-gray-400">Paste this URL into your AI tool (Claude, Cursor, …) as a custom MCP connector:</p>
-            <div className="mt-1 flex items-center gap-2">
-              <code className="flex-1 truncate rounded bg-black/40 px-3 py-2 text-xs">{mcpUrl}</code>
-              <Button variant="ghost" onClick={() => copy(mcpUrl, "url")}>{copied === "url" ? "Copied" : "Copy"}</Button>
-            </div>
-          </div>
-        )}
-
-        <div className="mt-5">
-          {keys.length === 0 ? <p className="text-sm text-gray-500">No keys yet.</p> : (
-            <ul className="space-y-2">
-              {keys.map((k) => (
-                <li key={k.token_hash} className="flex items-center justify-between rounded-lg border border-white/5 bg-black/20 px-3 py-2 text-sm">
-                  <div>
-                    <span>{k.description}</span>
-                    <span className="ml-2 text-xs text-gray-600">…{k.token_hash.slice(-8)}</span>
-                  </div>
-                  <button onClick={() => revoke(k.token_hash)} className="text-xs text-red-400 hover:underline">revoke</button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </Card>
-    </div>
-  );
-}
-
-/* ------------------------------ dashboard --------------------------------- */
-const TABS = ["Documents", "Ingest", "Search", "API Keys", "Settings"] as const;
-type Tab = (typeof TABS)[number];
-
-function Dashboard({ session }: { session: Session }) {
-  const [tab, setTab] = useState<Tab>("Documents");
-  const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
-  const email = session.user.email ?? "";
-
-  const loadMetrics = useCallback(async () => {
-    try { setMetrics(await apiFetch<Metrics>("/api/v1/metrics")); } catch { /* ignore */ }
-  }, []);
-  useEffect(() => { loadMetrics(); }, [loadMetrics, refreshKey]);
-
-  return (
-    <div className="mx-auto max-w-5xl px-6 py-8">
-      <header className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-600/20 text-lg">📚</div>
-          <div>
-            <h1 className="text-lg font-semibold leading-tight">OpenPDFSpecs</h1>
-            <p className="text-xs text-gray-500">{email}</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-4">
-          {metrics && (
-            <span className="hidden text-xs text-gray-500 sm:inline">
-              tokens: {metrics.ingestion.total.toLocaleString()} ingest · {metrics.sandbox.total.toLocaleString()} search
-            </span>
-          )}
-          <Button variant="ghost" onClick={() => supabase.auth.signOut()}>Sign out</Button>
-        </div>
-      </header>
-
-      <nav className="mt-8 flex gap-1 border-b border-white/10">
-        {TABS.map((t) => (
-          <button key={t} onClick={() => setTab(t)}
-            className={`px-4 py-2 text-sm transition ${
-              tab === t ? "border-b-2 border-indigo-500 text-white" : "text-gray-400 hover:text-gray-200"
-            }`}>{t}</button>
-        ))}
-      </nav>
-
-      <main className="mt-6">
-        {tab === "Documents" && <DocumentsPanel refreshKey={refreshKey} />}
-        {tab === "Ingest" && <IngestPanel onQueued={() => setRefreshKey((k) => k + 1)} />}
-        {tab === "Search" && <SearchPanel />}
-        {tab === "API Keys" && <KeysPanel />}
-        {tab === "Settings" && <SettingsPanel onSaved={() => setRefreshKey((k) => k + 1)} />}
-      </main>
-    </div>
-  );
-}
-
-/* -------------------------------- root ------------------------------------ */
-export default function Home() {
-  const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [keys, setKeys] = useState<any[]>([]);
+  const [name, setName] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [newKey, setNewKey] = useState<any>(null);
+  const [copied, setCopied] = useState("");
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setLoading(false);
-    });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
+    loadKeys();
   }, []);
 
-  if (loading) {
-    return <div className="flex min-h-screen items-center justify-center text-sm text-gray-500">Loading…</div>;
+  async function loadKeys() {
+    try {
+      const data = await apiFetch("/api/v1/keys");
+      setKeys(data);
+    } catch (e) { console.error(e); }
   }
-  return session ? <Dashboard session={session} /> : <LoginScreen />;
+
+  async function generateKey(e: FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setLoading(true);
+    try {
+      const data: any = await apiFetch("/api/v1/keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description: name })
+      });
+      setNewKey(data);
+      setName("");
+      loadKeys();
+    } catch (e) { console.error(e); }
+    setLoading(false);
+  }
+
+  async function revokeKey(id: string) {
+    if (!confirm("Revoke this key? MCP clients using it will immediately lose access.")) return;
+    try {
+      await apiFetch(`/api/v1/keys/${id}`, { method: "DELETE" });
+      loadKeys();
+    } catch (e) { console.error(e); }
+  }
+
+  const copyToClipboard = (text: string, type: string) => {
+    navigator.clipboard.writeText(text);
+    setCopied(type);
+    setTimeout(() => setCopied(""), 2000);
+  };
+
+  return (
+    <div className="max-w-3xl space-y-8">
+      <div className="space-y-1">
+        <h2 className="text-base font-medium text-white">API Keys</h2>
+        <p className="text-sm text-zinc-500">Generate keys to connect external AI agents (like Cursor or Claude Code) via MCP.</p>
+      </div>
+
+      <form onSubmit={generateKey} className="flex gap-3">
+        <Input 
+          placeholder="Key name (e.g., 'Claude Desktop')" 
+          value={name} onChange={e => setName(e.target.value)}
+          className="max-w-xs"
+        />
+        <Button type="submit" disabled={loading || !name.trim()}>Generate</Button>
+      </form>
+
+      {newKey && (
+        <Card className="p-5 border-zinc-700 bg-zinc-900/50 flex flex-col gap-4">
+          <div className="flex items-center gap-2 text-white text-sm font-medium">
+            <Icons.Check /> Key Generated Successfully
+          </div>
+          <p className="text-xs text-zinc-400">Copy these values now. You won't be able to see the secret token again.</p>
+          
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <label className="text-xs text-zinc-500">Secret Token</label>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 bg-black border border-zinc-800 px-3 py-2 rounded text-xs text-zinc-300 font-mono truncate">
+                  {newKey.plain_token}
+                </code>
+                <Button variant="secondary" onClick={() => copyToClipboard(newKey.plain_token, 'token')} className="!px-3">
+                  {copied === 'token' ? <Icons.Check /> : <Icons.Copy />}
+                </Button>
+              </div>
+            </div>
+            
+            <div className="space-y-1.5">
+              <label className="text-xs text-zinc-500">MCP Client Configuration URL</label>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 bg-black border border-zinc-800 px-3 py-2 rounded text-xs text-zinc-300 font-mono truncate">
+                  {`${API_BASE}/mcp/sse?token=${newKey.plain_token}`}
+                </code>
+                <Button variant="secondary" onClick={() => copyToClipboard(`${API_BASE}/mcp/sse?token=${newKey.plain_token}`, 'url')} className="!px-3">
+                  {copied === 'url' ? <Icons.Check /> : <Icons.Copy />}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      <div className="grid gap-3">
+        {keys.map(k => (
+          <Card key={k.id} className="p-4 flex items-center justify-between group">
+            <div>
+              <div className="text-sm font-medium text-zinc-300">{k.name}</div>
+              <div className="text-xs text-zinc-500 mt-1 flex items-center gap-3">
+                <span>Created {new Date(k.created_at).toLocaleDateString()}</span>
+                <span className="font-mono">...{k.token_hint}</span>
+              </div>
+            </div>
+            <Button variant="danger" className="opacity-0 group-hover:opacity-100" onClick={() => revokeKey(k.id)}>
+              Revoke
+            </Button>
+          </Card>
+        ))}
+        {keys.length === 0 && <p className="text-sm text-zinc-600">No active API keys.</p>}
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ config, onSave }: any) {
+  const [provider, setProvider] = useState(config.llm_provider || "gemini");
+  const [geminiKey, setGeminiKey] = useState("");
+  const [nvidiaKey, setNvidiaKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function handleSave(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setMsg("");
+    try {
+      const payload = {
+        llm_provider: provider,
+        gemini_api_key: geminiKey || undefined,
+        nvidia_api_key: nvidiaKey || undefined,
+      };
+      await apiFetch("/api/v1/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      setMsg("Settings saved.");
+      setGeminiKey("");
+      setNvidiaKey("");
+      onSave();
+    } catch (err: any) {
+      setMsg(err.message);
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="max-w-xl">
+      <div className="mb-8 space-y-1">
+        <h2 className="text-base font-medium text-white">System Settings</h2>
+        <p className="text-sm text-zinc-500">Configure LLM providers and database parameters.</p>
+      </div>
+
+      <form onSubmit={handleSave} className="space-y-8">
+        <div className="space-y-4">
+          <label className="text-sm font-medium text-zinc-300">LLM Provider</label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className={`cursor-pointer rounded-lg border p-4 transition-colors ${provider === 'gemini' ? 'border-white bg-zinc-900' : 'border-zinc-800 bg-[#0a0a0a] hover:border-zinc-700'}`}>
+              <div className="flex items-center gap-2 mb-1">
+                <input type="radio" name="provider" value="gemini" checked={provider === 'gemini'} onChange={() => setProvider('gemini')} className="accent-white" />
+                <span className="text-sm font-medium text-white">Google Gemini</span>
+              </div>
+              <p className="text-xs text-zinc-500 pl-5">Free tier extraction</p>
+            </label>
+            <label className={`cursor-pointer rounded-lg border p-4 transition-colors ${provider === 'nvidia' ? 'border-white bg-zinc-900' : 'border-zinc-800 bg-[#0a0a0a] hover:border-zinc-700'}`}>
+              <div className="flex items-center gap-2 mb-1">
+                <input type="radio" name="provider" value="nvidia" checked={provider === 'nvidia'} onChange={() => setProvider('nvidia')} className="accent-white" />
+                <span className="text-sm font-medium text-white">Nvidia NIM</span>
+              </div>
+              <p className="text-xs text-zinc-500 pl-5">Developer program</p>
+            </label>
+          </div>
+        </div>
+
+        <div className="space-y-4 pt-4 border-t border-zinc-900">
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-zinc-300">API Credentials</label>
+            {config.gemini_has_key && provider === 'gemini' && <span className="text-xs text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded">Configured</span>}
+            {config.nvidia_has_key && provider === 'nvidia' && <span className="text-xs text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded">Configured</span>}
+          </div>
+          
+          {provider === 'gemini' ? (
+            <div className="space-y-2">
+              <label className="text-xs text-zinc-500">Update Gemini API Key</label>
+              <Input type="password" value={geminiKey} onChange={e => setGeminiKey(e.target.value)} placeholder="AIzaSy..." />
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <label className="text-xs text-zinc-500">Update Nvidia API Key</label>
+              <Input type="password" value={nvidiaKey} onChange={e => setNvidiaKey(e.target.value)} placeholder="nvapi-..." />
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-4 pt-4">
+          <Button type="submit" disabled={saving}>
+            {saving ? "Saving..." : "Save Settings"}
+          </Button>
+          {msg && <span className="text-sm text-zinc-400">{msg}</span>}
+        </div>
+      </form>
+    </div>
+  );
 }
