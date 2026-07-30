@@ -266,7 +266,7 @@ function DocumentsPanel() {
           <div className="grid gap-3">
             {tasks.map(t => {
               const p = (function() { try { return JSON.parse(t.progress_info || "{}"); } catch { return {}; } })();
-              const pct = p.progress != null ? Math.round(p.progress * 100) : 0;
+              const pct = p.progress != null ? Math.round(p.progress) : 0;
               const statusMsg = p.status || t.status;
               return (
                 <Card key={t.id} className="p-4 flex flex-col gap-3">
