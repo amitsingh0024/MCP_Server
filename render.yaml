@@ -23,8 +23,8 @@ services:
       # --- Non-secret config ---
       - key: SUPABASE_STORAGE_BUCKET
         value: pdf-uploads
-      # Embedding dimension — must equal the vector(N) column (0003 set it to 1024 for
-      # NVIDIA nv-embedqa-e5-v5). The model itself is derived per provider in code.
+      # Embedding dimension — must equal the vector(N) column (0003 set it to 1024) and
+      # PDFSPECS_NVIDIA_EMBED_DIMENSIONS below.
       - key: PDFSPECS_EMBEDDING_DIM
         value: "1024"
       # Embedding backend. MUST be set explicitly, and MUST match the backend the corpus
@@ -36,6 +36,23 @@ services:
       # hold the model in memory.
       - key: PDFSPECS_EMBEDDING_BACKEND
         value: nvidia
+      # Model ids, set here so a provider retirement is a dashboard edit, not a release.
+      # NVIDIA switches hosted models off on a schedule and then answers 410 Gone, which
+      # is a client error: it is never retried, so every ingestion fails. Both previous
+      # defaults died exactly that way (nv-embedqa-e5-v5 on 2026-08-25, and
+      # meta/llama-3.1-8b-instruct). Current ids:
+      #   https://integrate.api.nvidia.com/v1/models
+      - key: PDFSPECS_NVIDIA_EMBEDDING_MODEL
+        value: nvidia/nemotron-3.5-embed-1b
+      - key: PDFSPECS_NVIDIA_LLM_MODEL
+        value: nvidia/nemotron-3.5-lightning-30b-a3b
+      # Matryoshka width requested from the embedding model. MUST equal
+      # PDFSPECS_EMBEDDING_DIM above and the vector(N) column. The model is natively
+      # 2048-d; 1024 keeps the existing column and index, and pgvector cannot build an
+      # HNSW index above 2000 dimensions in any case. Leave empty for a model that does
+      # not support reduced widths.
+      - key: PDFSPECS_NVIDIA_EMBED_DIMENSIONS
+        value: "1024"
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
         sync: false

@@ -23,7 +23,8 @@ from pgvector.psycopg import register_vector
 logger = logging.getLogger("pdfspecs.pgdb")
 
 # Platform-wide embedding dimension. Must match the vector(N) column in the schema —
-# 1024, for NVIDIA nv-embedqa-e5-v5, the only embedding model (migrations 0003 / 0005).
+# 1024 (migrations 0003 / 0005). Both supported backends meet it: BAAI/bge-m3 natively,
+# and the NVIDIA model via Matryoshka reduction (PDFSPECS_NVIDIA_EMBED_DIMENSIONS).
 EMBEDDING_DIM = int(os.getenv("PDFSPECS_EMBEDDING_DIM", "1024"))
 
 _pool: ConnectionPool | None = None

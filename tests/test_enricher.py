@@ -242,5 +242,137 @@ class TestEmbeddingBatchAlignment(unittest.TestCase):
                 enricher.embed_texts_batch(["A" * 3000, "B" * 50], settings=self.settings)
 
 
+class TestRetiredModelHandling(unittest.TestCase):
+    """
+    A retired provider model must fail with an actionable message, not a bare HTTP error.
+
+    NVIDIA retires hosted models on a schedule and answers 410 Gone afterwards. Because a
+    410 is a client error it is never retried, so it fails the chunk, the document, and
+    then every document. Both former defaults died this way — nv-embedqa-e5-v5 on
+    2026-08-25 and meta/llama-3.1-8b-instruct — and the only clue in the task's
+    error_message was `410 Client Error: Gone`, which says nothing about what to change.
+    """
+
+    @staticmethod
+    def _gone(model: str) -> mock.Mock:
+        resp = mock.Mock()
+        resp.status_code = 410
+        resp.text = ('{"status":410,"title":"Gone","detail":"The model \'' + model +
+                     '\' has reached its end of life on 2026-08-25T09:00:00Z."}')
+        resp.raise_for_status.side_effect = HTTPError(
+            "410 Client Error: Gone for url: ...", response=resp)
+        return resp
+
+    def _post(self, url, model):
+        with mock.patch.object(enricher, "_throttle"), \
+             mock.patch.object(enricher.requests, "post",
+                               return_value=self._gone(model)) as post:
+            with self.assertRaises(enricher.ModelRetiredError) as ctx:
+                enricher._post_with_retry(url, {"model": model}, {})
+        return str(ctx.exception), post.call_count
+
+    def test_retired_embedding_model_names_its_env_var(self):
+        msg, calls = self._post("https://integrate.api.nvidia.com/v1/embeddings",
+                                "nvidia/nv-embedqa-e5-v5")
+        self.assertIn("nvidia/nv-embedqa-e5-v5", msg)
+        self.assertIn("PDFSPECS_NVIDIA_EMBEDDING_MODEL", msg)
+        self.assertEqual(calls, 1, "a 410 must not be retried — it can never succeed")
+
+    def test_retired_llm_names_the_other_env_var(self):
+        msg, _ = self._post("https://integrate.api.nvidia.com/v1/chat/completions",
+                            "meta/llama-3.1-8b-instruct")
+        self.assertIn("PDFSPECS_NVIDIA_LLM_MODEL", msg)
+        self.assertNotIn("PDFSPECS_NVIDIA_EMBEDDING_MODEL", msg)
+
+    def test_no_default_model_is_a_known_retired_one(self):
+        """Guards against reintroducing a model the provider has already switched off."""
+        retired = {"nvidia/nv-embedqa-e5-v5", "meta/llama-3.1-8b-instruct"}
+        self.assertNotIn(enricher.NVIDIA_EMBEDDING_MODEL, retired)
+        self.assertNotIn(enricher.NVIDIA_LLM_MODEL, retired)
+
+
+class TestEmbeddingWidthRequest(unittest.TestCase):
+    """
+    The requested embedding width must reach the provider and match the vector(N) column.
+
+    The current default model is natively 2048-d with Matryoshka reduction, so the request
+    has to ask for 1024 to fit the existing column — and pgvector cannot build an HNSW
+    index above 2000 dimensions, so a full-width 2048 vector could not be indexed at all.
+    """
+
+    def setUp(self):
+        self.settings = enricher.ProviderSettings(nvidia_api_key="nvapi-test")
+        env = mock.patch.dict(os.environ, {"PDFSPECS_EMBEDDING_BACKEND": "nvidia"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _captured_payload(self, dims):
+        seen = {}
+
+        def post(url, json_payload=None, headers=None, **kw):
+            seen.update(json_payload)
+            r = mock.Mock()
+            r.json.return_value = {"data": [{"index": 0, "embedding": [0.1] * 4}],
+                                   "usage": {"prompt_tokens": 1}}
+            return r
+
+        with mock.patch.object(enricher, "NVIDIA_EMBED_DIMENSIONS", dims), \
+             mock.patch.object(enricher, "_post_with_retry", side_effect=post):
+            enricher.embed_texts_batch(["short text"], settings=self.settings)
+        return seen
+
+    def test_width_is_sent_when_configured(self):
+        self.assertEqual(self._captured_payload(1024).get("dimensions"), 1024)
+
+    def test_width_is_omitted_when_unset(self):
+        """A model without Matryoshka support rejects the parameter outright."""
+        self.assertNotIn("dimensions", self._captured_payload(None))
+
+    def test_input_type_still_distinguishes_query_from_passage(self):
+        self.assertEqual(self._captured_payload(1024).get("input_type"), "passage")
+
+
+class TestThinkingDisabled(unittest.TestCase):
+    """
+    Enrichment must not pay for chain-of-thought it does not need.
+
+    The configured model is a reasoning model. Measured on one chunk with the real prompt,
+    reasoning cost 21.8s and 1,824 completion tokens against 1.6s and 94 with thinking
+    switched off — identical valid JSON either way. Over a ~5,000 chunk corpus that is
+    hours and ~1M tokens of waste, so the request must carry the off switch.
+    """
+
+    def test_thinking_is_switched_off_in_the_request(self):
+        payload = enricher._chat_payload("some/model", "prompt")
+        self.assertEqual(payload.get("chat_template_kwargs"), {"thinking": False})
+
+    def test_switch_can_be_disabled_for_models_that_reject_it(self):
+        with mock.patch.object(enricher, "DISABLE_THINKING", False):
+            self.assertNotIn("chat_template_kwargs", enricher._chat_payload("m", "p"))
+
+    def test_max_tokens_is_never_sent(self):
+        """A reasoning model cut off mid-thought returns content=None and nothing parses."""
+        self.assertNotIn("max_tokens", enricher._chat_payload("m", "p"))
+
+    def test_json_object_response_format_is_requested(self):
+        self.assertEqual(enricher._chat_payload("m", "p").get("response_format"),
+                         {"type": "json_object"})
+
+    def test_null_content_gives_a_diagnosable_error(self):
+        """
+        The regression that mattered: a null content raised TypeError('NoneType' object is
+        not subscriptable) several frames away, which says nothing about the real cause.
+        """
+        resp = mock.Mock()
+        resp.json.return_value = {
+            "choices": [{"message": {"content": None, "reasoning_content": "thinking..."},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+        with mock.patch.object(enricher, "_post_with_retry", return_value=resp):
+            with self.assertRaises(ValueError):
+                enricher._call_nvidia_llm("text", "key", "model")
+
+
 if __name__ == "__main__":
     unittest.main()
