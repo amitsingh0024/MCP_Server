@@ -41,7 +41,7 @@ class Config:
         self.config_path = config_path
         self.settings = {
             "nvidia_api_key": "",
-            "llm_model": "meta/llama-3.1-8b-instruct",
+            "llm_model": "nvidia/nemotron-3.5-lightning-30b-a3b",
             "embedding_model": "BAAI/bge-m3",
             "chunk_size": 2500,
             "chunk_overlap": 250,
@@ -77,7 +77,7 @@ class Config:
         # before the Postgres migration. Nothing wrote to it any more, so it was a second
         # source of truth that could only ever be stale (REVAMP Phase B).
         self.nvidia_api_key = os.getenv("NVIDIA_API_KEY", self.settings.get("nvidia_api_key", ""))
-        self.llm_model = os.getenv("PDFSPECS_LLM_MODEL", self.settings.get("llm_model", "meta/llama-3.1-8b-instruct"))
+        self.llm_model = os.getenv("PDFSPECS_LLM_MODEL", self.settings.get("llm_model", "nvidia/nemotron-3.5-lightning-30b-a3b"))
         self.embedding_model = os.getenv("PDFSPECS_EMBEDDING_MODEL", self.settings.get("embedding_model", "BAAI/bge-m3"))
         self.chunk_size = int(os.getenv("PDFSPECS_CHUNK_SIZE", self.settings.get("chunk_size", 2500)))
         self.chunk_overlap = int(os.getenv("PDFSPECS_CHUNK_OVERLAP", self.settings.get("chunk_overlap", 250)))

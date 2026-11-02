@@ -32,6 +32,17 @@ class APIKeyMissingError(ValueError):
     pass
 
 
+class ModelRetiredError(RuntimeError):
+    """
+    The provider has retired the configured model (HTTP 410 Gone).
+
+    Worth its own type because a 410 is a client error: it is never retried, so it fails
+    the task, then the document, then every document. Diagnosing it from a bare
+    `410 Client Error` took reading the response body by hand — the message below names
+    the model and the env var that changes it.
+    """
+
+
 # Global request throttle — spaces out ALL provider API calls (across worker threads) to
 # respect free-tier rate limits (e.g. NVIDIA 429s). Ingestion gets slower but reliable.
 # PDFSPECS_API_MIN_INTERVAL seconds between request starts; 0 disables. Default ~40 req/min.
@@ -52,7 +63,21 @@ def _throttle():
         _last_request_ts = time.monotonic()
 
 
-NVIDIA_LLM_MODEL = "meta/llama-3.1-8b-instruct"
+# Model ids are ENV-OVERRIDABLE, deliberately not constants. NVIDIA retires hosted models
+# on a schedule, and a retired model answers 410 Gone — a client error, so it is never
+# retried and every ingestion fails. Both previous defaults died this way:
+# nv-embedqa-e5-v5 reached end of life on 2026-08-25 and meta/llama-3.1-8b-instruct
+# followed, which took the whole pipeline down and needed a code change to fix. Overriding
+# by env means the next retirement is a config edit, not a release.
+# Verified callable on 2026-11-02; most ids in /v1/models answer 404 for a given account,
+# so "listed" is not "available" — probe before changing this.
+#
+# It is a REASONING model: one small chunk cost 1,185 completion tokens of which 1,100 were
+# reasoning, and it returns content=None unless allowed to finish, so never send max_tokens
+# with it. Enrichment is stage 2 and off the critical path, so the token cost buys
+# summaries without delaying searchability.
+NVIDIA_LLM_MODEL = os.getenv("PDFSPECS_NVIDIA_LLM_MODEL",
+                             "nvidia/nemotron-3.5-lightning-30b-a3b")
 
 # Two embedding backends, BOTH 1024-d, so they share the vector(1024) column and switching
 # needs no migration. Selected by PDFSPECS_EMBEDDING_BACKEND; `local` is the default.
@@ -61,13 +86,29 @@ NVIDIA_LLM_MODEL = "meta/llama-3.1-8b-instruct"
 #            multilingual coverage. Cost is throughput: measured on this host (Intel
 #            i7-8750H, 2018) it runs ~19.8 chunks/min on CPU and ~8.3 on MPS — about
 #            13 hours for a 15,700-chunk corpus.
-#   nvidia — nv-embedqa-e5-v5 over the NIM API. Batches 32 windows per request, so the
+#   nvidia — NVIDIA_EMBEDDING_MODEL over the NIM API. Batches 32 windows per request, so the
 #            same corpus takes ~30 minutes even at the 1.5s throttle. Costs API quota.
 #
 # NOTE for `local`: MPS is *slower* than CPU on an Intel Mac (the "GPU" is a weak
 # integrated part, not Apple Silicon). Set PDFSPECS_EMBED_DEVICE=cpu there.
-LOCAL_EMBEDDING_MODEL = "BAAI/bge-m3"                # 1024-d
-NVIDIA_EMBEDDING_MODEL = "nvidia/nv-embedqa-e5-v5"   # 1024-d
+LOCAL_EMBEDDING_MODEL = os.getenv("PDFSPECS_LOCAL_EMBEDDING_MODEL",
+                                  "BAAI/bge-m3")                      # 1024-d
+NVIDIA_EMBEDDING_MODEL = os.getenv("PDFSPECS_NVIDIA_EMBEDDING_MODEL",
+                                   "nvidia/nemotron-3.5-embed-1b")    # 2048-d native
+
+# Embedding width to REQUEST from the provider. It must equal the vector(N) column, or
+# pgdb._clean_embedding rejects every vector.
+#
+# The default NVIDIA model is natively 2048-d but supports Matryoshka reduction (any width
+# from 128 to 2048), so asking for 1024 keeps the existing vector(1024) column and its HNSW
+# index untouched. That is not merely convenient: pgvector cannot build an HNSW index above
+# 2000 dimensions, so a model pinned to 2048 could not use the index this schema relies on.
+#
+# Set PDFSPECS_NVIDIA_EMBED_DIMENSIONS empty to omit the parameter entirely, which is what
+# a model without Matryoshka support (e.g. nemotron-3-embed-1b, 2048-d only) requires.
+_embed_dims_raw = os.getenv("PDFSPECS_NVIDIA_EMBED_DIMENSIONS",
+                            os.getenv("PDFSPECS_EMBEDDING_DIM", "1024")).strip()
+NVIDIA_EMBED_DIMENSIONS = int(_embed_dims_raw) if _embed_dims_raw else None
 
 
 def embedding_backend() -> str:
@@ -130,6 +171,19 @@ def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1
                     e = HTTPError(f"{e} :: {detail}", response=e.response,
                                   request=getattr(e, "request", None))
 
+            # 410 Gone means the model itself is retired. Retrying can never help, and the
+            # fix is a config change, so say so instead of leaving a raw HTTP error.
+            if isinstance(e, HTTPError) and e.response is not None \
+                    and e.response.status_code == 410:
+                model = (json_payload or {}).get("model", "?")
+                var = ("PDFSPECS_NVIDIA_EMBEDDING_MODEL" if "embeddings" in url
+                       else "PDFSPECS_NVIDIA_LLM_MODEL")
+                raise ModelRetiredError(
+                    f"NVIDIA has retired the model {model!r}, so this request can never "
+                    f"succeed. Pick a current model from "
+                    f"https://integrate.api.nvidia.com/v1/models and set {var}. "
+                    f"Provider response: {e}") from e
+
             if attempt == max_retries - 1:
                 raise e
 
@@ -175,13 +229,7 @@ def _call_nvidia_llm(text: str, api_key: str, model: str, usage_sink=None) -> di
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": ENRICH_PROMPT.format(text=text)}
-        ],
-        "response_format": {"type": "json_object"}
-    }
+    payload = _chat_payload(model, ENRICH_PROMPT.format(text=text))
 
     response = _post_with_retry(url, json_payload=payload, headers=headers)
     data = response.json()
@@ -193,15 +241,30 @@ def _call_nvidia_llm(text: str, api_key: str, model: str, usage_sink=None) -> di
 
     try:
         content_str = data["choices"][0]["message"]["content"]
+        if content_str is None:
+            # A reasoning model cut off mid-thought puts its chain of thought in
+            # `reasoning_content` and leaves `content` null. Say that, rather than
+            # failing with a TypeError several frames away.
+            raise ValueError(
+                f"{data['choices'][0].get('finish_reason')!r} response carried no content "
+                f"(a reasoning model that never finished thinking). Leave max_tokens unset "
+                f"and keep PDFSPECS_NVIDIA_DISABLE_THINKING enabled.")
         return json.loads(content_str)
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         logger.error(f"Failed to parse Nvidia response: {e}. Raw response: {data}")
         raise ValueError("Invalid response format from Nvidia NIM API")
 
 
-# Token budget per window. nv-embedqa-e5-v5 hard-caps at 512 and returns
-# `400 Input length N exceeds maximum allowed token size 512` — a client error, so it is
-# NOT retried and the whole document fails. Aim well under the cap.
+# Token budget per window. This 400 was sized for nv-embedqa-e5-v5 (now retired), which
+# hard-capped at 512 tokens and returned `400 Input length N exceeds maximum allowed token
+# size 512` — a client error, so not retried, failing the whole document.
+#
+# The current default model accepts 32,768 tokens, so this is now far more conservative
+# than it needs to be: it yields many small windows per chunk rather than a few rich ones.
+# Raising it would mean fewer vectors and likely better passages, but it changes retrieval
+# granularity and re-embedding cost, so it is left alone and tunable rather than guessed at.
+# Keep it under the configured model's real cap — the splitting retry in _embed_one_batch
+# is a safety net, not a licence to exceed it.
 EMBED_TOKEN_BUDGET = int(os.getenv("PDFSPECS_EMBED_TOKEN_BUDGET", "400"))
 
 # Tokens-per-character, MEASURED against the live API (by reading the token count back out
@@ -356,10 +419,11 @@ def _embed_one_batch(batch: list, url, headers, model, input_type, purpose, usag
     so a bad estimate costs a little retrieval granularity instead of a document.
     """
     try:
-        response = _post_with_retry(url, json_payload={
-            "input": batch, "model": model,
-            "encoding_format": "float", "input_type": input_type,
-        }, headers=headers)
+        payload = {"input": batch, "model": model,
+                   "encoding_format": "float", "input_type": input_type}
+        if NVIDIA_EMBED_DIMENSIONS:
+            payload["dimensions"] = NVIDIA_EMBED_DIMENSIONS
+        response = _post_with_retry(url, json_payload=payload, headers=headers)
     except Exception as exc:
         if not _is_token_limit_error(exc) or depth >= 4:
             raise
@@ -523,6 +587,36 @@ def extract_metadata(text: str, settings: ProviderSettings, usage_sink=None) -> 
 # only costs one small batch, and so the prompt stays well inside the context window.
 ENRICH_BATCH_SIZE = int(os.getenv("PDFSPECS_ENRICH_BATCH_SIZE", "8"))
 
+# Reasoning models think before answering, which this task does not need: enrichment is
+# "summarize in two sentences and list the entities", not a problem to work through.
+# Measured on nemotron-3.5-lightning-30b-a3b with one chunk and the real prompt:
+#
+#   reasoning on    21.8s   1,733 reasoning tokens   1,824 completion tokens
+#   thinking=False   1.6s           0                    94
+#
+# Same valid JSON either way — 13x faster and 19x cheaper with it off. Across a ~5,000
+# chunk corpus that is hours and ~1M tokens of pure waste. Note `/no_think` and
+# `detailed_thinking off` in a system message do NOT work on this model; only the
+# chat_template_kwargs form does.
+#
+# Set PDFSPECS_NVIDIA_DISABLE_THINKING=0 if a configured model rejects the parameter.
+DISABLE_THINKING = os.getenv("PDFSPECS_NVIDIA_DISABLE_THINKING", "1").strip().lower() \
+    not in ("0", "false", "no")
+
+
+def _chat_payload(model: str, prompt: str) -> dict:
+    """Build the chat request body shared by the single and batched enrichment calls."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+    }
+    if DISABLE_THINKING:
+        payload["chat_template_kwargs"] = {"thinking": False}
+    # Deliberately NO max_tokens: a reasoning model that is cut off mid-thought returns
+    # content=None, and the caller then has nothing to parse.
+    return payload
+
 ENRICH_BATCH_PROMPT = """You will be given {n} numbered text chunks from a document.
 For EACH chunk, extract:
 1. A concise 1-2 sentence summary of the key information.
@@ -568,9 +662,7 @@ def extract_metadata_batch(texts: list, settings: ProviderSettings, usage_sink=N
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {settings.nvidia_api_key}",
                "Content-Type": "application/json"}
-    payload = {"model": settings.llm_model,
-               "messages": [{"role": "user", "content": prompt}],
-               "response_format": {"type": "json_object"}}
+    payload = _chat_payload(settings.llm_model, prompt)
 
     response = _post_with_retry(url, json_payload=payload, headers=headers)
     data = response.json()

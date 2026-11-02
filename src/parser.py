@@ -27,6 +27,23 @@ _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 # scripts with whitespace or punctuation; this adjacency is a decoding artefact.
 _SCRIPT_MIX = re.compile(r"[ऀ-ॿ][A-Za-z0-9]|[A-Za-z0-9][ऀ-ॿ]")
 
+# A codepoint from an unrelated script wedged against Devanagari. U+0370-U+077F spans
+# Greek, Cyrillic, Armenian, Hebrew, Arabic, Syriac and Arabic Extended-A — none of which
+# belongs mid-word in this corpus.
+#
+# This is the MIS-mapped case, as opposed to the UN-mapped case the signals above catch. A
+# broken ToUnicode table can map a glyph to a valid codepoint in the wrong script, so the
+# extracted text is structurally perfect: no control bytes, no private-use area, no U+FFFD,
+# and no Devanagari-next-to-ASCII. It reads as clean text and scored 0 on every one of the
+# 119 corrupted chunks in the Yogaratnakara test ingest, so OCR never ran and 89% of the
+# book was stored with mangled Sanskrit (e.g. `ݻवरुद्धाहार` for `विरुद्धाहार`, where U+077B
+# stands in for `वि`).
+#
+# Adjacency, not mere presence, is what makes this safe: a genuinely Arabic or Greek
+# passage separated by whitespace is left alone, matching _SCRIPT_MIX's reasoning.
+_FOREIGN_NEAR_DEVANAGARI = re.compile(
+    r"[ऀ-ॿ][\u0370-\u077F]|[\u0370-\u077F][ऀ-ॿ]")
+
 # Hits required before a page is called corrupted. >1 so a single odd character doesn't
 # cost a 5s OCR pass on an otherwise clean page.
 CORRUPTION_MIN_HITS = 2
@@ -39,7 +56,8 @@ def corruption_score(text: str) -> int:
     return (len(_CTRL.findall(text))
             + len(_PUA.findall(text))
             + text.count("�")
-            + len(_SCRIPT_MIX.findall(text)))
+            + len(_SCRIPT_MIX.findall(text))
+            + len(_FOREIGN_NEAR_DEVANAGARI.findall(text)))
 
 
 def looks_corrupted(text: str, min_hits: int = CORRUPTION_MIN_HITS) -> bool:

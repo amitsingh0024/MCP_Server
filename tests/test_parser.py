@@ -111,6 +111,27 @@ class TestCorruptionDetection(unittest.TestCase):
         # Raw C0 bytes are the signature of an absent/broken ToUnicode CMap.
         self.assertTrue(parser.looks_corrupted("त\x14माद\x12यEता$महानु\x1eपCते ति*लङ्ग एव"))
 
+    def test_mismapped_foreign_script_is_flagged(self):
+        """
+        The regression that mattered: a broken ToUnicode table maps glyphs to valid
+        codepoints in the WRONG script, so the text is structurally perfect — no control
+        bytes, no private-use area, no U+FFFD, no Devanagari-beside-ASCII — and scored 0.
+        OCR therefore never ran, and 89% of the Yogaratnakara test ingest was stored with
+        mangled Sanskrit. U+077B here stands in for `वि`.
+        """
+        corrupted = "ݻवरुद्धाहारचेष्टस्य मन्दाग्नेݻनर्वश्चलस्य च"
+        self.assertTrue(parser.looks_corrupted(corrupted))
+        self.assertGreaterEqual(parser.corruption_score(corrupted), 2)
+
+    def test_genuinely_multilingual_text_is_not_flagged(self):
+        """
+        Presence of another script is not corruption — adjacency is. Scripts separated by
+        whitespace are how real multilingual text reads, so this must stay clean or every
+        such page pays for a needless OCR pass.
+        """
+        self.assertFalse(parser.looks_corrupted("ज्वरचिकित्सितं العربية ज्वरः"))
+        self.assertFalse(parser.looks_corrupted("fever ज्वरः Ελληνικά"))
+
     def test_single_stray_signal_does_not_trigger(self):
         """One odd character mustn't cost a ~5s OCR pass on an otherwise clean page."""
         self.assertEqual(parser.corruption_score("a normal page\x01"), 1)
