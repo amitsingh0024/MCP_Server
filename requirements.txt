@@ -1,7 +1,6 @@
 mcp<2.0.0
 pymupdf>=1.24.0
 numpy>=1.24.0
-google-genai>=0.1.0
 requests>=2.31.0
 pydantic>=2.0.0
 fastapi>=0.110.0
@@ -18,3 +17,10 @@ pgvector>=0.3.0
 
 # Auth (Supabase JWT verification via JWKS)
 pyjwt>=2.8.0
+# Local embeddings (BAAI/bge-m3, 1024-d — matches the vector(1024) column)
+torch>=2.0.0
+sentence-transformers>=3.0.0
+
+# OCR. Tesseract (pytesseract, above) is the always-available fallback; PaddleOCR is the
+# preferred engine for Devanagari when its models are available for the configured lang.
+paddleocr>=3.0.0

@@ -1,4 +1,6 @@
 -- OpenPDFSpecs — Row-Level Security policies (M1)
+-- @supabase-only  <- the migration runner skips this file on a database with no `auth`
+--                    schema (i.e. local Postgres), since everything below needs auth.uid().
 -- SUPABASE-ONLY: these reference auth.uid(), which exists in Supabase's auth schema.
 -- Run this AFTER 0001_init_schema.sql, in the Supabase SQL editor.
 --

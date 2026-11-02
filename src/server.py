@@ -27,6 +27,8 @@ import src.auth as auth
 import src.storage as storage
 import src.ingest as ingest
 import src.search as search
+import src.enricher as enricher
+import src.mcp_tools as mcp_tools
 from src.config import get_config
 
 logging.basicConfig(level=logging.INFO,
@@ -41,8 +43,14 @@ logger = logging.getLogger("pdfspecs.server")
 async def lifespan(app: FastAPI):
     # Background ingestion worker (skippable so a web-only replica or local test doesn't
     # run a second worker against the shared DB).
+    if auth.local_mode():
+        logger.warning(
+            "PDFSPECS_LOCAL_MODE is set: the admin API skips JWT verification and serves "
+            "the implicit local org. Only loopback callers are accepted%s.",
+            " (OVERRIDDEN — remote callers allowed)" if auth.allow_remote_local_mode() else "")
     if os.getenv("PDFSPECS_DISABLE_WORKER", "").lower() not in ("1", "true", "yes"):
-        pgdb.reset_stuck_tasks()
+        # run_worker_loop runs crash recovery itself, scoped to its own worker id — doing
+        # it here as well would sweep with no identity at all.
         threading.Thread(target=ingest.run_worker_loop, daemon=True).start()
         logger.info("Background ingestion worker started.")
     else:
@@ -74,8 +82,24 @@ def _bearer(authorization: str | None) -> str | None:
     return None
 
 
-def require_admin(authorization: str = Header(None)) -> dict:
-    """Verify a Supabase user JWT and resolve (bootstrapping) the caller's org."""
+def require_admin(request: Request, authorization: str = Header(None)) -> dict:
+    """
+    Verify a Supabase user JWT and resolve (bootstrapping) the caller's org.
+
+    Under PDFSPECS_LOCAL_MODE the JWT check is skipped entirely, which is only safe for a
+    caller on this machine — so a non-loopback peer is refused here rather than handed
+    admin. The app cannot see its own bind address (uvicorn takes --host on the command
+    line, and the Dockerfile passes 0.0.0.0), so the check has to be per-request.
+    """
+    if auth.local_mode() and not auth.allow_remote_local_mode():
+        peer = request.client.host if request.client else ""
+        if not auth.client_is_loopback(peer):
+            logger.error("Refused a local-mode admin request from %s", peer or "an unknown peer")
+            raise HTTPException(status_code=403, detail=(
+                "PDFSPECS_LOCAL_MODE bypasses authentication, so the admin API only "
+                "answers callers on this machine. Unset PDFSPECS_LOCAL_MODE to use normal "
+                "Supabase authentication, or set PDFSPECS_ALLOW_REMOTE_LOCAL_MODE=1 to "
+                "accept remote unauthenticated callers deliberately."))
     token = _bearer(authorization)
     try:
         return auth.authenticate_admin(token)
@@ -111,25 +135,25 @@ def get_me(admin: dict = Depends(require_admin)):
 def get_config_status(admin: dict = Depends(require_admin)):
     org = admin["org_id"]
     return {
-        "provider": pgdb.get_setting(org, "provider") or "gemini",
-        "has_gemini_key": bool(pgdb.get_setting(org, "gemini_api_key", decrypt=True)),
+        # NVIDIA NIM is the only provider (REVAMP Part A). Reported as a constant so the
+        # frontend needs no provider-selection state.
+        "provider": "nvidia",
         "has_nvidia_key": bool(pgdb.get_setting(org, "nvidia_api_key", decrypt=True)),
-        "llm_model": pgdb.get_setting(org, "llm_model") or "gemini-2.5-flash",
-        "embedding_model": pgdb.get_setting(org, "embedding_model") or "text-embedding-004",
+        "llm_model": pgdb.get_setting(org, "llm_model") or enricher.NVIDIA_LLM_MODEL,
+        "embedding_model": enricher.default_embedding_model(),
+        "embedding_backend": enricher.embedding_backend(),
     }
 
 
 @app.post("/api/v1/config")
 def save_config(payload: dict, admin: dict = Depends(require_admin)):
     org = admin["org_id"]
-    if payload.get("provider") in ("gemini", "nvidia"):
-        pgdb.save_setting(org, "provider", payload["provider"])
-    for secret in ("gemini_api_key", "nvidia_api_key"):
-        if secret in payload and payload[secret]:
-            pgdb.save_setting(org, secret, payload[secret], encrypt=True)
-    for plain in ("llm_model", "embedding_model"):
-        if plain in payload:
-            pgdb.save_setting(org, plain, str(payload[plain]))
+    payload = payload or {}
+    if payload.get("nvidia_api_key"):
+        pgdb.save_setting(org, "nvidia_api_key", payload["nvidia_api_key"], encrypt=True)
+    if payload.get("llm_model"):
+        pgdb.save_setting(org, "llm_model", str(payload["llm_model"]))
+    # embedding_model is NOT settable: its dimension must match the vector(N) column.
     return {"status": "success"}
 
 
@@ -140,7 +164,10 @@ def list_documents(admin: dict = Depends(require_admin)):
 
 @app.delete("/api/v1/documents/{doc_id}")
 def delete_document(doc_id: str, admin: dict = Depends(require_admin)):
-    pgdb.delete_document(admin["org_id"], doc_id)
+    # documents.id is a uuid column: an unknown or malformed id used to reach Postgres and
+    # come back as a 500, or report success for a document that was never there.
+    if not pgdb.delete_document(admin["org_id"], doc_id):
+        raise HTTPException(status_code=404, detail=f"No such document: {doc_id}")
     return {"status": "success"}
 
 
@@ -200,7 +227,9 @@ def admin_search(payload: dict, admin: dict = Depends(require_admin)):
     query = (payload or {}).get("query")
     if not query:
         raise HTTPException(status_code=400, detail="Missing 'query'")
-    limit = int((payload or {}).get("limit", 5))
+    # clamp_limit, not int(): an unbounded limit asks Postgres for limit*10 candidate rows
+    # from both indexes, and a non-numeric one used to 500 instead of being ignored.
+    limit = search.clamp_limit((payload or {}).get("limit", search.DEFAULT_SEARCH_LIMIT))
     return {"results": search.hybrid_search(admin["org_id"], query, limit)}
 
 
@@ -212,7 +241,7 @@ def agent_search(payload: dict, org_id: str = Depends(require_api_key)):
     query = (payload or {}).get("query")
     if not query:
         raise HTTPException(status_code=400, detail="Missing 'query'")
-    limit = int((payload or {}).get("limit", 5))
+    limit = search.clamp_limit((payload or {}).get("limit", search.DEFAULT_SEARCH_LIMIT))
     return {"results": search.hybrid_search(org_id, query, limit)}
 
 
@@ -247,86 +276,13 @@ else:
 # `?token=` query param rides along on every request (unlike SSE, whose server-generated
 # message endpoint dropped it). streamable_http_path="/" so the mount at "/mcp" yields "/mcp".
 # json_response=True returns plain JSON for POSTs so clients that don't accept SSE still work.
-# Server-level instructions are delivered to the connecting AI on initialize, so it knows
-# what this knowledgebase is and how to use the tools without any extra prompting.
-MCP_INSTRUCTIONS = """\
-OpenPDFSpecs is a searchable knowledgebase of classical Ayurvedic texts (e.g. Charaka \
-Samhita, Sushruta Samhita, Ashtanga Hridayam/Sangraha by Vagbhata, Yogaratnakara).
-
-Use these tools to answer questions grounded in the source texts:
-- search_knowledge(query, limit=5): hybrid lexical + semantic search. Best first step for
-  any question. Query by symptom, condition, treatment, herb, or concept (e.g. "treatment
-  for fever", "jwara", "uses of guduchi"). Returns matching passages with a summary, the
-  source file, page range, and a chunk_id.
-- retrieve_chunk(chunk_id): read the full text of a specific chunk returned by a search.
-- entity_lookup(entity_name): find every passage where a concept, herb, person, or term
-  appears across the library.
-- list_documents_tool(): list the source documents available.
-
-Guidance: search first, then retrieve_chunk for detail before answering. Ground answers in
-retrieved content and cite the source file and page range. If nothing relevant is found,
-say so rather than guessing. These are historical texts, not medical advice.
-"""
-
-mcp = FastMCP("OpenPDFSpecs", instructions=MCP_INSTRUCTIONS,
+mcp = FastMCP("OpenPDFSpecs", instructions=mcp_tools.MCP_INSTRUCTIONS,
               stateless_http=True, json_response=True,
               streamable_http_path="/", transport_security=_mcp_security)
 
-
-@mcp.tool()
-def list_documents_tool() -> str:
-    """List all indexed documents available in this knowledgebase."""
-    docs = pgdb.list_documents(_mcp_org())
-    if not docs:
-        return "No documents have been indexed yet."
-    lines = ["# Documents", "", "| ID | Filename | Size (KB) | Ingested |", "|---|---|---|---|"]
-    for d in docs:
-        lines.append(f"| `{d['id']}` | {d['filename']} | {round(d['size_bytes']/1024,1)} | {d['created_at']} |")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def search_knowledge(query: str, limit: int = 5) -> str:
-    """Hybrid (lexical + semantic) search over the knowledgebase. Returns matching chunks."""
-    rows = search.hybrid_search(_mcp_org(), query, limit)
-    if not rows:
-        return f"No matches for: '{query}'."
-    out = [f"# Search Results for: '{query}'", ""]
-    for i, r in enumerate(rows):
-        snippet = (r["text_content"] or "")[:400].replace("\n", " ")
-        out += [f"### {i+1}. {r['filename']} (pages {r['page_start']}-{r['page_end']})",
-                f"- Chunk ID: `{r['id']}`",
-                f"- Score: {round(r['score'],4)}",
-                f"- Summary: {r.get('summary','')}",
-                f"- Snippet: \"{snippet}...\"", ""]
-    return "\n".join(out)
-
-
-@mcp.tool()
-def retrieve_chunk(chunk_id: str) -> str:
-    """Retrieve the full text of a chunk by its ID."""
-    row = pgdb.get_chunk(_mcp_org(), chunk_id)
-    if not row:
-        return f"Chunk `{chunk_id}` not found."
-    return "\n".join([f"# {row['filename']}",
-                      f"Pages {row['page_start']}-{row['page_end']}", "",
-                      "## Summary", row.get("summary") or "", "",
-                      "## Content", "```text", row["text_content"], "```"])
-
-
-@mcp.tool()
-def entity_lookup(entity_name: str) -> str:
-    """Find chunks/documents associated with an entity, concept, or term."""
-    rows = pgdb.entity_lookup(_mcp_org(), entity_name)
-    if not rows:
-        return f"No occurrences found for entity: '{entity_name}'."
-    out = [f"# Occurrences of '{entity_name}'", "",
-           "| Document | Pages | Entity (Type) | Chunk |", "|---|---|---|---|"]
-    for r in rows:
-        summ = (r.get("summary") or "")[:60].replace("\n", " ")
-        out.append(f"| {r['filename']} | {r['page_start']}-{r['page_end']} | "
-                   f"{r['entity_name']} ({r['entity_type']}) | `{r['chunk_id']}`: {summ}... |")
-    return "\n".join(out)
+# Tool bodies live in src/mcp_tools.py so this transport and the stdio one (src/mcp_server.py)
+# can't drift apart. Here the org comes from the request's API key via the contextvar below.
+mcp_tools.register_tools(mcp, _mcp_org)
 
 
 class MCPAuthMiddleware:
