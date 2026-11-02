@@ -1,6 +1,17 @@
 # OpenPDFSpecs (PDF RAG over MCP)
 
-OpenPDFSpecs is a local-first, Python-based document knowledge engine. It parses, chunks, and enriches PDF files using free-tier LLM/embedding APIs, storing everything in a local SQLite relational graph database. It exposes this knowledgebase to AI assistants (Cursor, Claude Code, etc.) over the Model Context Protocol (MCP).
+OpenPDFSpecs is a Python document knowledge engine. It parses, chunks, and enriches PDF files using free-tier LLM/embedding APIs, and exposes the resulting knowledgebase to AI assistants (Cursor, Claude Code, etc.) over the Model Context Protocol (MCP).
+
+> ### ⚠️ This README is out of date
+>
+> It describes the original single-user SQLite build. The project has since moved to
+> multi-tenant Postgres (Supabase) + an HTTP MCP endpoint, and `src/cli.py`,
+> `src/mcp_server.py`, `src/db.py` and `src/queue.py` **no longer exist** — every CLI
+> command below is currently non-functional.
+>
+> For how things actually work today see **[docs/AUDIT.md](docs/AUDIT.md)** (current state)
+> and **[docs/REVAMP.md](docs/REVAMP.md)** (what's changing). This file is rewritten in
+> Phase B, when the local-first / stdio story lands.
 
 ---
 
@@ -9,7 +20,7 @@ OpenPDFSpecs is a local-first, Python-based document knowledge engine. It parses
 - **Blazing Fast Local PDF Parsing**: Uses `PyMuPDF` (C-based engine) to parse text and detect tables, formatting tables as clean Markdown.
 - **Relational Graph Database**: Models document structures and semantic entities in a local, zero-dependency `SQLite` database.
 - **Hybrid Search**: Fuses SQLite FTS5 lexical text search with fast in-memory NumPy cosine similarity of embeddings.
-- **Free API Tier Integrations**: Supports Google Gemini or Nvidia Developer NIM APIs for cost-free LLM extraction and embeddings.
+- **Free API Tier Integration**: Uses the Nvidia Developer NIM API (`meta/llama-3.1-8b-instruct` for extraction, `nvidia/nv-embedqa-e5-v5` for embeddings) for cost-free enrichment.
 - **Background Async Ingestion**: Queues PDF tasks and processes them incrementally (skips unchanged PDFs using SHA-256 diff checks).
 - **FastMCP Server**: Standard stdio-based MCP server containing search, retrieve, and entity lookup tools.
 
@@ -19,7 +30,7 @@ OpenPDFSpecs is a local-first, Python-based document knowledge engine. It parses
 
 ### 1. Prerequisites
 - Python 3.14+
-- A Google Gemini API Key (or Nvidia NIM API Key)
+- An Nvidia NIM API Key (`nvapi-...`) from the Nvidia Developer program
 
 ### 2. Setup Virtual Environment
 Initialize a Python virtual environment and install dependencies:
@@ -39,12 +50,6 @@ Initialize the SQLite schema:
 ## Configuration
 
 Settings are stored in `config.json`. You can modify it directly or use the CLI.
-
-### Set Provider
-Choose `gemini` (default) or `nvidia`:
-```bash
-.venv/bin/python src/cli.py set-provider gemini
-```
 
 ### Set API Key
 Provide your developer API key:
@@ -109,7 +114,7 @@ Add the server config in Cursor (`Settings -> MCP`) or Claude Desktop configurat
         "/absolute/path/to/workspace/src/mcp_server.py"
       ],
       "env": {
-        "GEMINI_API_KEY": "YOUR_GEMINI_KEY"
+        "NVIDIA_API_KEY": "YOUR_NVIDIA_KEY"
       }
     }
   }

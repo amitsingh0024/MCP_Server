@@ -99,6 +99,9 @@ const Select = ({ children, ...props }: any) => (
 import { supabase } from "@/lib/supabase";
 import { apiFetch, API_BASE } from "@/lib/api";
 
+// Set NEXT_PUBLIC_LOCAL_MODE=1 alongside the backend's PDFSPECS_LOCAL_MODE=1.
+const LOCAL_MODE = process.env.NEXT_PUBLIC_LOCAL_MODE === "1";
+
 export default function Home() {
   const [session, setSession] = useState<any>(null);
   const [authLoading, setAuthLoading] = useState(false);
@@ -108,6 +111,14 @@ export default function Home() {
   const [config, setConfig] = useState<any>({});
 
   useEffect(() => {
+    // Local mode (REVAMP Phase B): there is no Supabase project to authenticate against,
+    // and the backend's require_admin resolves the single implicit local org without a
+    // token. Synthesize a session so the dashboard renders; apiFetch simply sends no
+    // Authorization header. Only safe because the local API binds to loopback.
+    if (LOCAL_MODE) {
+      setSession({ user: { email: "local@localhost" } });
+      return;
+    }
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
     });
@@ -141,6 +152,7 @@ export default function Home() {
   }
 
   async function handleLogout() {
+    if (LOCAL_MODE) return;   // nothing to sign out of
     await supabase.auth.signOut();
   }
 
@@ -189,7 +201,9 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-6 text-sm">
-            <Button variant="ghost" onClick={handleLogout} className="!px-2 !py-1 text-xs">Sign out</Button>
+            {LOCAL_MODE
+              ? <span className="text-xs text-zinc-500 px-2 py-1">Local mode</span>
+              : <Button variant="ghost" onClick={handleLogout} className="!px-2 !py-1 text-xs">Sign out</Button>}
           </div>
         </header>
 
@@ -590,8 +604,6 @@ function KeysPanel() {
 }
 
 function SettingsPanel({ config, onSave }: any) {
-  const [provider, setProvider] = useState(config.llm_provider || "gemini");
-  const [geminiKey, setGeminiKey] = useState("");
   const [nvidiaKey, setNvidiaKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState("");
@@ -601,18 +613,12 @@ function SettingsPanel({ config, onSave }: any) {
     setSaving(true);
     setMsg("");
     try {
-      const payload = {
-        llm_provider: provider,
-        gemini_api_key: geminiKey || undefined,
-        nvidia_api_key: nvidiaKey || undefined,
-      };
       await apiFetch("/api/v1/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ nvidia_api_key: nvidiaKey || undefined })
       });
       setMsg("Settings saved.");
-      setGeminiKey("");
       setNvidiaKey("");
       onSave();
     } catch (err: any) {
@@ -625,48 +631,30 @@ function SettingsPanel({ config, onSave }: any) {
     <div className="max-w-xl">
       <div className="mb-8 space-y-1">
         <h2 className="text-base font-medium text-white">System Settings</h2>
-        <p className="text-sm text-zinc-500">Configure LLM providers and database parameters.</p>
+        <p className="text-sm text-zinc-500">Configure the NVIDIA NIM credentials used for extraction and embeddings.</p>
       </div>
 
       <form onSubmit={handleSave} className="space-y-8">
         <div className="space-y-4">
-          <label className="text-sm font-medium text-zinc-300">LLM Provider</label>
-          <div className="grid grid-cols-2 gap-3">
-            <label className={`cursor-pointer rounded-lg border p-4 transition-colors ${provider === 'gemini' ? 'border-white bg-zinc-900' : 'border-zinc-800 bg-[#0a0a0a] hover:border-zinc-700'}`}>
-              <div className="flex items-center gap-2 mb-1">
-                <input type="radio" name="provider" value="gemini" checked={provider === 'gemini'} onChange={() => setProvider('gemini')} className="accent-white" />
-                <span className="text-sm font-medium text-white">Google Gemini</span>
-              </div>
-              <p className="text-xs text-zinc-500 pl-5">Free tier extraction</p>
-            </label>
-            <label className={`cursor-pointer rounded-lg border p-4 transition-colors ${provider === 'nvidia' ? 'border-white bg-zinc-900' : 'border-zinc-800 bg-[#0a0a0a] hover:border-zinc-700'}`}>
-              <div className="flex items-center gap-2 mb-1">
-                <input type="radio" name="provider" value="nvidia" checked={provider === 'nvidia'} onChange={() => setProvider('nvidia')} className="accent-white" />
-                <span className="text-sm font-medium text-white">Nvidia NIM</span>
-              </div>
-              <p className="text-xs text-zinc-500 pl-5">Developer program</p>
-            </label>
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-zinc-300">API Credentials</label>
+            {/* Backend returns `has_nvidia_key`. This read used to be `nvidia_has_key`,
+                which is undefined — the badge never appeared regardless of state. */}
+            {config.has_nvidia_key && <span className="text-xs text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded">Configured</span>}
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-xs text-zinc-500">Update Nvidia API Key</label>
+            <Input type="password" value={nvidiaKey} onChange={(e: any) => setNvidiaKey(e.target.value)} placeholder="nvapi-..." />
           </div>
         </div>
 
-        <div className="space-y-4 pt-4 border-t border-zinc-900">
-          <div className="flex items-center justify-between">
-            <label className="text-sm font-medium text-zinc-300">API Credentials</label>
-            {config.gemini_has_key && provider === 'gemini' && <span className="text-xs text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded">Configured</span>}
-            {config.nvidia_has_key && provider === 'nvidia' && <span className="text-xs text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded">Configured</span>}
-          </div>
-          
-          {provider === 'gemini' ? (
-            <div className="space-y-2">
-              <label className="text-xs text-zinc-500">Update Gemini API Key</label>
-              <Input type="password" value={geminiKey} onChange={(e: any) => setGeminiKey(e.target.value)} placeholder="AIzaSy..." />
-            </div>
-          ) : (
-            <div className="space-y-2">
-              <label className="text-xs text-zinc-500">Update Nvidia API Key</label>
-              <Input type="password" value={nvidiaKey} onChange={(e: any) => setNvidiaKey(e.target.value)} placeholder="nvapi-..." />
-            </div>
-          )}
+        <div className="space-y-2 pt-4 border-t border-zinc-900">
+          <label className="text-sm font-medium text-zinc-300">Models</label>
+          <p className="text-xs text-zinc-500">
+            LLM <span className="text-zinc-400">{config.llm_model}</span> · Embeddings{" "}
+            <span className="text-zinc-400">{config.embedding_model}</span>
+          </p>
         </div>
 
         <div className="flex items-center gap-4 pt-4">

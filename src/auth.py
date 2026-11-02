@@ -28,9 +28,91 @@ JWT_AUDIENCE = "authenticated"
 # Asymmetric algorithms advertised by Supabase's JWKS (new signing-key model).
 JWT_ALGORITHMS = ["ES256", "RS256", "EdDSA"]
 
+# --- Local single-user mode (REVAMP Phase B) -------------------------------
+# With PDFSPECS_LOCAL_MODE set, there is no Supabase and no login: the process serves one
+# implicit org owned by this fixed uid. `orgs.owner_auth_id` is a uuid column, so the
+# sentinel is a valid UUID rather than a string like "local".
+LOCAL_OWNER_AUTH_ID = "00000000-0000-0000-0000-000000000001"
+LOCAL_ORG_NAME = "Local"
+LOCAL_EMAIL = "local@localhost"
+
 
 class AuthError(Exception):
     """Raised when a token/JWT cannot be authenticated."""
+
+
+def local_mode() -> bool:
+    """True when the process runs as a single-user local install (no Supabase auth)."""
+    return os.getenv("PDFSPECS_LOCAL_MODE", "").strip().lower() in ("1", "true", "yes")
+
+
+def allow_remote_local_mode() -> bool:
+    """
+    True when the operator has explicitly allowed local mode outside a local context.
+
+    Local mode bypasses authentication entirely, so it is only safe when both the database
+    and the callers are on this machine. This one override waives both checks — the remote
+    database guard below, and the loopback-caller guard on the admin API.
+    """
+    return os.getenv("PDFSPECS_ALLOW_REMOTE_LOCAL_MODE", "").strip().lower() in (
+        "1", "true", "yes")
+
+
+# Hosts that count as "this machine". Anything else in DATABASE_URL is a remote database.
+_LOCAL_DB_HOSTS = {"", "localhost", "127.0.0.1", "::1", "/tmp", "/var/run/postgresql"}
+
+# Peer addresses that count as a caller on this machine, for the local-mode admin guard.
+LOOPBACK_CLIENTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def client_is_loopback(host: str) -> bool:
+    """True when a request's peer address is this machine."""
+    return (host or "").strip().lower() in LOOPBACK_CLIENTS
+
+
+def _database_is_local(dsn: str) -> bool:
+    """True when a Postgres DSN points at this machine (TCP localhost or a unix socket)."""
+    if not dsn:
+        return True                      # nothing configured; nothing to warn about
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(dsn).hostname or "").strip().lower()
+    except Exception:
+        return False                     # unparseable: treat as remote, i.e. be cautious
+    return host in _LOCAL_DB_HOSTS
+
+
+def assert_local_database():
+    """
+    Refuse to run local-mode commands against a REMOTE database.
+
+    Local mode bypasses authentication entirely and serves one implicit org. Pointed at a
+    hosted database it silently creates that org there and writes secrets into production —
+    which is exactly what happened when PDFSPECS_LOCAL_MODE was set in the shell while
+    DATABASE_URL still resolved to Supabase from .env.
+    """
+    if not local_mode():
+        return
+    dsn = os.environ.get("DATABASE_URL", "")
+    if _database_is_local(dsn):
+        return
+    from urllib.parse import urlparse
+    host = urlparse(dsn).hostname or "?"
+    raise AuthError(
+        f"Refusing to run in local mode against the remote database at '{host}'.\n"
+        f"PDFSPECS_LOCAL_MODE=1 bypasses authentication and would create the implicit "
+        f"local org there.\n"
+        f"Set DATABASE_URL to a local database (e.g. postgresql:///pdfspecs), or unset "
+        f"PDFSPECS_LOCAL_MODE to use normal authentication.\n"
+        f"Override deliberately with PDFSPECS_ALLOW_REMOTE_LOCAL_MODE=1."
+    )
+
+
+def local_org_id() -> str:
+    """The org_id of the implicit local org, creating it on first use."""
+    if not allow_remote_local_mode():
+        assert_local_database()
+    return pgdb.get_or_create_org(LOCAL_OWNER_AUTH_ID, name=LOCAL_ORG_NAME)
 
 
 # =====================================================================
@@ -77,7 +159,19 @@ def authenticate_admin(token: str) -> dict:
     """
     Verify the admin's JWT and resolve (bootstrapping on first login) their org.
     Returns {"auth_uid": str, "email": str, "org_id": str}.
+
+    In local mode the token is ignored entirely and the implicit local org is returned —
+    there is no Supabase project to verify against.
+
+    That makes this a FULL authentication bypass, safe only for a caller on this machine.
+    Nothing here can see the bind address (under uvicorn/gunicorn it comes from the command
+    line), so the transport must reject non-loopback callers before calling this — see
+    client_is_loopback() and the server's require_admin.
     """
+    if local_mode():
+        return {"auth_uid": LOCAL_OWNER_AUTH_ID, "email": LOCAL_EMAIL,
+                "org_id": local_org_id()}
+
     claims = verify_supabase_jwt(token)
     auth_uid = claims.get("sub")
     if not auth_uid:

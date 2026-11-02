@@ -27,6 +27,15 @@ services:
       # NVIDIA nv-embedqa-e5-v5). The model itself is derived per provider in code.
       - key: PDFSPECS_EMBEDDING_DIM
         value: "1024"
+      # Embedding backend. MUST be set explicitly, and MUST match the backend the corpus
+      # was embedded with: vectors from two different models are not comparable, and
+      # search.py disables the semantic half outright when it detects a mismatch. Leaving
+      # this unset fell back to `local` (BAAI/bge-m3) while the corpus is
+      # nv-embedqa-e5-v5, which silently reduced production to lexical-only search — and
+      # also pulled torch + sentence-transformers into a free-plan container that cannot
+      # hold the model in memory.
+      - key: PDFSPECS_EMBEDDING_BACKEND
+        value: nvidia
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
         sync: false
