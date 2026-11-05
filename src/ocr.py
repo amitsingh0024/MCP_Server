@@ -1,4 +1,7 @@
 import io
+import os
+import re
+import time
 import logging
 from abc import ABC, abstractmethod
 from PIL import Image
@@ -138,6 +141,136 @@ class PaddleOCRProvider(OCRProvider):
             return None
 
 
+# =====================================================================
+# Indic OCR microservice (self-hosted Baidu Unlimited-OCR-2, LoRA fine-tuned)
+# =====================================================================
+# Configured by env rather than config.json: this is a deployment endpoint, not a per-org
+# or per-document setting, and it differs between a laptop tunnel and a hosted GPU.
+INDIC_URL = os.getenv("PDFSPECS_OCR_SERVICE_URL", "").strip().rstrip("/")
+INDIC_KEY = os.getenv("PDFSPECS_OCR_SERVICE_KEY", "").strip()
+# Render DPI for the page image sent to the model. 200 is what the model was validated at
+# here; 300 (what Tesseract uses) triples the upload for no measured gain.
+INDIC_DPI = int(os.getenv("PDFSPECS_OCR_SERVICE_DPI", "200"))
+# Seconds per page. Measured ~77s per dense Devanagari page on a 6GB RTX 4050, so the
+# default has to be generous or every page times out mid-generation.
+INDIC_TIMEOUT = int(os.getenv("PDFSPECS_OCR_SERVICE_TIMEOUT", "300"))
+# fast_mode defaults OFF, against the service's own default of on. Measured on a dense
+# Sanskrit page: 75.9s with it vs 76.7s without — no speed gain, because latency is
+# dominated by ~880 GENERATED tokens at ~11 tok/s, not by the visual tokens fast_mode
+# trims. Accuracy, though, clearly degrades:
+#   fast_mode=false  एकदेशोष्टितः शोफो ब्रणानां पूर्वलक्षणम् ॥   (correct)
+#   fast_mode=true   एकदेशोचित: ओफो बशानां पूर्वनक्षामू ||       (garbled)
+INDIC_FAST_MODE = os.getenv("PDFSPECS_OCR_SERVICE_FAST_MODE", "0").strip().lower() \
+    in ("1", "true", "yes")
+# Model checkpoint; empty uses whatever the service has loaded ("latest").
+INDIC_CHECKPOINT = os.getenv("PDFSPECS_OCR_SERVICE_CHECKPOINT", "").strip()
+
+# The service prefixes multi-page output with a page banner; strip it so it never reaches
+# a chunk's text (and from there the tsvector and the embedding).
+_PAGE_BANNER = re.compile(r"^#{1,6}\s*(?:\U0001F4C4|📄)?\s*Page\s+\d+\s*$", re.MULTILINE)
+
+
+class IndicOCRServiceProvider(OCRProvider):
+    """
+    OCR via the self-hosted Indic OCR microservice (POST /v1/parse).
+
+    Unlike Tesseract and PaddleOCR this is a vision-language model, which matters in two
+    ways. It returns Markdown with tables already rendered as HTML, so the PyMuPDF table
+    extraction the other providers append is NOT added here — it would duplicate content
+    the model already laid out. And it is slow: roughly 77s per dense page, serialized on
+    one GPU, so it is worth OCR'ing only the pages that actually need it (which is what
+    parser's corruption check decides).
+    """
+
+    def __init__(self, base_url: str = None, api_key: str = None, dpi: int = None,
+                 timeout: int = None, fast_mode: bool = None, checkpoint: str = None,
+                 retries: int = 2):
+        self.base_url = (base_url or INDIC_URL).rstrip("/")
+        if not self.base_url:
+            raise ValueError(
+                "PDFSPECS_OCR_SERVICE_URL is not set, so the 'indic' OCR provider has no "
+                "endpoint to call (e.g. https://<host>, serving POST /v1/parse).")
+        self.api_key = api_key if api_key is not None else INDIC_KEY
+        self.dpi = dpi or INDIC_DPI
+        self.timeout = timeout or INDIC_TIMEOUT
+        self.fast_mode = INDIC_FAST_MODE if fast_mode is None else fast_mode
+        self.checkpoint = checkpoint if checkpoint is not None else INDIC_CHECKPOINT
+        self.retries = retries
+
+        import requests
+        self.requests = requests
+
+        # Probe once at construction. get_ocr_provider degrades to Tesseract when a
+        # provider can't be built, so an unreachable endpoint is caught here — once, loudly
+        # — instead of failing every page of every document in turn.
+        r = self.requests.get(f"{self.base_url}/healthz", timeout=30)
+        r.raise_for_status()
+        health = r.json()
+        if not health.get("model_loaded"):
+            raise RuntimeError(f"OCR service at {self.base_url} reports model_loaded=false")
+        logger.info("Indic OCR service ready at %s (gpu=%s, dpi=%d, fast_mode=%s)",
+                    self.base_url, health.get("gpu_name", "?"), self.dpi, self.fast_mode)
+
+    def _headers(self) -> dict:
+        # The service accepts either header and enforces neither when API_SECRET_KEY is
+        # unset on its side, so an empty key is a valid local configuration.
+        return {"X-API-Key": self.api_key} if self.api_key else {}
+
+    def ocr_page(self, page, tables) -> str:
+        page_no = getattr(page, "number", "?")
+        try:
+            png = page.get_pixmap(dpi=self.dpi).tobytes("png")
+        except Exception as e:
+            logger.error("Could not rasterise page %s for OCR (%s: %s).",
+                         page_no, type(e).__name__, e)
+            return None
+
+        data = {"pages": "1", "fast_mode": str(self.fast_mode).lower()}
+        if self.checkpoint:
+            data["checkpoint"] = self.checkpoint
+
+        last = None
+        for attempt in range(self.retries + 1):
+            try:
+                resp = self.requests.post(
+                    f"{self.base_url}/v1/parse",
+                    files={"file": (f"page_{page_no}.png", png, "image/png")},
+                    data=data, headers=self._headers(), timeout=self.timeout)
+                # A 4xx is our mistake (bad key, bad form field) and will not improve on
+                # retry; a 5xx or a dropped tunnel might.
+                if 400 <= resp.status_code < 500:
+                    logger.error("OCR service rejected page %s: %s %s",
+                                 page_no, resp.status_code, resp.text[:200])
+                    return None
+                resp.raise_for_status()
+                payload = resp.json()
+                if not payload.get("success", True):
+                    logger.error("OCR service reported failure on page %s: %s",
+                                 page_no, str(payload)[:200])
+                    return None
+                text = _PAGE_BANNER.sub("", payload.get("markdown") or "").strip()
+                if not text:
+                    logger.error("OCR service returned no text for page %s; falling back "
+                                 "to the text layer, which may be the corrupted one.", page_no)
+                    return None
+                return text
+            except Exception as e:
+                last = e
+                if attempt < self.retries:
+                    wait = 2 ** attempt
+                    logger.warning("OCR service call failed for page %s (%s: %s); retrying "
+                                   "in %ss (%d/%d).", page_no, type(e).__name__,
+                                   str(e)[:120], wait, attempt + 1, self.retries)
+                    time.sleep(wait)
+
+        # Returning None means the caller keeps the text layer. For this provider that is
+        # usually the corrupted layer we were trying to replace, so log at ERROR.
+        logger.error("OCR service unreachable for page %s after %d attempts (%s: %s); "
+                     "keeping the existing text layer.", page_no, self.retries + 1,
+                     type(last).__name__ if last else "?", str(last)[:150])
+        return None
+
+
 def get_ocr_provider(provider_name: str, **kwargs) -> OCRProvider:
     """
     Build the configured OCR provider, degrading to Tesseract rather than raising.
@@ -150,12 +283,22 @@ def get_ocr_provider(provider_name: str, **kwargs) -> OCRProvider:
     """
     provider_name = (provider_name or "").lower().strip()
 
-    if provider_name not in ("paddle", "tesseract"):
+    if provider_name not in ("paddle", "tesseract", "indic"):
         logger.warning("Unknown OCR provider %r; using Tesseract.", provider_name)
         return TesseractOCR(**kwargs)
 
     if provider_name == "tesseract":
         return TesseractOCR(**kwargs)
+
+    if provider_name == "indic":
+        try:
+            return IndicOCRServiceProvider(**kwargs)
+        except Exception as e:
+            logger.error("Indic OCR service unavailable (%s: %s); falling back to "
+                         "Tesseract, which produces markedly worse Devanagari. Check "
+                         "PDFSPECS_OCR_SERVICE_URL and that the service is reachable.",
+                         type(e).__name__, e)
+            return TesseractOCR()
 
     try:
         return PaddleOCRProvider(**kwargs)

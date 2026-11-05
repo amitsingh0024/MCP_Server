@@ -79,7 +79,11 @@ def _progress(task_id, phase: str, detail: str, progress: int):
 
 def _embed_chunks(chunks: list, settings, task_id, usage_sink=None) -> list:
     """
-    Embed every chunk in batches, returning a list of window-vector lists.
+    Embed every chunk in batches.
+
+    Returns (per-chunk window-vector lists, count of chunks left unembedded). A batch the
+    provider could not embed yields empty lists rather than raising, so one outage costs
+    those chunks' vectors instead of the entire document.
 
     Batched across chunks so the backend fills its batches; embedding per chunk meant
     hundreds of tiny, under-filled calls per document.
@@ -87,15 +91,27 @@ def _embed_chunks(chunks: list, settings, task_id, usage_sink=None) -> list:
     n = len(chunks)
     texts = [c["text_content"] for c in chunks]
     out = []
+    unembedded = 0
     step = _embed_chunk_batch()
     for start in range(0, n, step):
         batch = texts[start:start + step]
-        out.extend(enricher.embed_texts_batch(
-            batch, settings=settings, input_type="passage", usage_sink=usage_sink))
+        try:
+            out.extend(enricher.embed_texts_batch(
+                batch, settings=settings, input_type="passage", usage_sink=usage_sink))
+        except Exception as e:
+            # A provider failure here used to abort the task, discarding the parse — which
+            # on this corpus is up to nine hours of OCR thrown away for one transient 5xx.
+            # The chunks are stored text-only instead (searchable lexically) and the
+            # embedding backfill completes them later.
+            logger.error("Embedding failed for chunks %d-%d (%s: %s); storing them "
+                         "text-only for the backfill pass.",
+                         start, min(start + step, n) - 1, type(e).__name__, e)
+            out.extend([[] for _ in batch])
+            unembedded += len(batch)
         done = min(start + step, n)
         _progress(task_id, "Embedding", f"Embedded {done}/{n} chunks",
                   20 + int(70 * done / max(1, n)))
-    return out
+    return out, unembedded
 
 
 def process_task(task: dict) -> bool:
@@ -150,29 +166,39 @@ def process_task(task: dict) -> bool:
         def usage_sink(purpose, prompt_tokens, completion_tokens):
             pgdb.record_token_usage(org_id, purpose, prompt_tokens, completion_tokens)
 
-        embeddings = _embed_chunks(chunks, settings, task_id, usage_sink=usage_sink)
+        embeddings, unembedded = _embed_chunks(chunks, settings, task_id,
+                                               usage_sink=usage_sink)
 
         # 7. Store chunks + window vectors in one transaction per document.
         #    `summary` is left NULL: stage 2 fills it in and sets enriched_at.
-        rows = [{
-            "page_start": c["page_start"],
-            "page_end": c["page_end"],
-            "text_content": c["text_content"],
-            "summary": None,
-            "embeddings": embeddings[i] if i < len(embeddings) else [],
-            "embedding_model": settings.resolved_embedding_model(),
-        } for i, c in enumerate(chunks)]
+        #    embedding_model is recorded ONLY for chunks that actually have vectors: it is
+        #    what corpus_embedding_models() reports, and a model claimed over chunks with
+        #    no vectors would corrupt search's query/corpus match check.
+        rows = []
+        for i, c in enumerate(chunks):
+            vecs = embeddings[i] if i < len(embeddings) else []
+            rows.append({
+                "page_start": c["page_start"],
+                "page_end": c["page_end"],
+                "text_content": c["text_content"],
+                "summary": None,
+                "embeddings": vecs,
+                "embedding_model": settings.resolved_embedding_model() if vecs else None,
+            })
 
         _progress(task_id, "Storing", f"Writing {len(rows)} chunks", 92)
         pgdb.add_chunks_bulk(org_id, doc_id, rows)
 
+        detail = (f"Searchable: {len(rows)} chunks stored. "
+                  f"Summaries/entities pending enrichment.")
+        if unembedded:
+            detail += (f" {unembedded} chunk(s) await embedding backfill "
+                       f"(provider was unavailable).")
         pgdb.update_task(task_id, "completed", document_id=doc_id,
                          progress_info=json.dumps({"phase": "Completed",
-                             "detail": f"Searchable: {len(rows)} chunks stored. "
-                                       f"Summaries/entities pending enrichment.",
-                             "progress": 100}))
-        logger.info("Completed task=%s (%d chunks stored, enrichment pending)",
-                    task_id, len(rows))
+                             "detail": detail, "progress": 100}))
+        logger.info("Completed task=%s (%d chunks stored, %d awaiting embeddings, "
+                    "enrichment pending)", task_id, len(rows), unembedded)
         return True
 
     except Exception as e:
@@ -196,6 +222,60 @@ def process_task(task: dict) -> bool:
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# =====================================================================
+# Stage 1.5 — embedding backfill for chunks stored text-only
+# =====================================================================
+def run_embedding_pass(org_id: str, limit: int = None, progress_cb=None) -> int:
+    """
+    Give vectors to chunks that were stored without them. Returns how many were embedded.
+
+    Ingestion no longer throws a document away when the embedding provider is down, so
+    those chunks land searchable-but-lexical-only and are completed here. Resumable by
+    construction: a chunk leaves the queue the moment its vectors are committed, so an
+    interrupted pass simply resumes.
+
+    Unlike enrichment this needs no LLM, so it still completes for an org whose provider
+    offers embeddings but no chat model.
+    """
+    settings = _org_provider_settings(org_id)
+    model = settings.resolved_embedding_model()
+
+    def usage_sink(purpose, prompt_tokens, completion_tokens):
+        pgdb.record_token_usage(org_id, purpose, prompt_tokens, completion_tokens)
+
+    done = 0
+    batch_size = _embed_chunk_batch()
+    # A chunk whose text yields no embedding windows at all (blank or whitespace-only)
+    # can never leave the pending set, and the query returns oldest-first — so without
+    # this the pass would re-fetch the same unembeddable row forever.
+    attempted = set()
+    while True:
+        remaining = None if limit is None else max(0, limit - done)
+        if remaining == 0:
+            break
+        batch = pgdb.chunks_pending_embedding(
+            org_id, limit=batch_size if remaining is None else min(batch_size, remaining))
+        if not batch:
+            break
+        if all(c["id"] in attempted for c in batch):
+            logger.warning("Embedding backfill: %d chunk(s) yielded no vectors and cannot "
+                           "be embedded (empty text?); leaving them lexical-only.",
+                           len(batch))
+            break
+        attempted.update(c["id"] for c in batch)
+
+        vectors = enricher.embed_texts_batch(
+            [c["text_content"] for c in batch], settings=settings,
+            input_type="passage", usage_sink=usage_sink)
+        for chunk, vecs in zip(batch, vectors):
+            if vecs:
+                pgdb.save_chunk_embeddings(org_id, chunk["id"], vecs, model)
+                done += 1
+                if progress_cb:
+                    progress_cb(done)
+    return done
 
 
 # =====================================================================
@@ -277,8 +357,12 @@ def run_enrichment_pass(org_id: str, limit: int = None, progress_cb=None) -> int
 
 def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: bool = True):
     """
-    Poll the queue and process tasks (stage 1). When the queue is idle, spend the time on
-    stage-2 enrichment so summaries backfill without a second process.
+    Poll the queue and process tasks (stage 1). When the queue is idle, spend the time
+    backfilling: embeddings first (search-critical, no LLM needed), then stage-2
+    enrichment, so both complete without a second process.
+
+    `enrich` governs only the LLM stage; the embedding backfill always runs, since a
+    corpus missing vectors is more broken than one missing summaries.
     """
     import time
     me = worker_id()
@@ -298,8 +382,27 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                 break
             continue
 
-        # Queue empty. Backfill enrichment in small slices so a newly queued document is
-        # picked up promptly rather than waiting for a whole corpus to be enriched.
+        # Queue empty. Backfill embeddings FIRST: they are the search-critical half, they
+        # need no LLM, and a corpus missing vectors is more broken than one missing
+        # summaries. Runs regardless of `enrich`, which governs only the LLM stage.
+        worked = False
+        try:
+            orgs = pgdb.orgs_with_pending_embedding()
+        except Exception as e:
+            logger.error("Could not list orgs pending embedding: %s", e)
+            orgs = []
+        for org in orgs:
+            try:
+                if run_embedding_pass(org, limit=200):
+                    worked = True
+                    break
+            except Exception as e:
+                logger.error("Embedding backfill failed for org %s: %s", org, e)
+        if worked:
+            continue
+
+        # Then enrichment, in small slices so a newly queued document is picked up
+        # promptly rather than waiting for a whole corpus to be enriched.
         if enrich:
             # Per-org error handling, INSIDE the loop. With the handler outside it, the
             # first org lacking an NVIDIA key aborted the whole scan — and since

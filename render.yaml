@@ -53,6 +53,24 @@ services:
       # not support reduced widths.
       - key: PDFSPECS_NVIDIA_EMBED_DIMENSIONS
         value: "1024"
+      # One window per embeddings request. The model 500s on almost any multi-input
+      # request, and since every retry fails the same way it takes the whole document
+      # down with it. Measured, not cautious — see src/enricher.py.
+      - key: PDFSPECS_NVIDIA_EMBED_BATCH
+        value: "1"
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
+        sync: false
+      # --- OCR ---
+      # `indic` routes OCR to the self-hosted Indic OCR microservice, the only provider
+      # that reads this Devanagari corpus correctly (Paddle has no Devanagari models in
+      # this image; Tesseract garbles the transliterations). Leave the worker disabled or
+      # the provider on tesseract if the service is not reachable from the platform.
+      - key: PDFSPECS_OCR_PROVIDER
+        value: indic
+      # Secret/volatile: a dev tunnel URL rotates, so set it in the dashboard rather than
+      # baking it in here.
+      - key: PDFSPECS_OCR_SERVICE_URL
+        sync: false
+      - key: PDFSPECS_OCR_SERVICE_KEY
         sync: false

@@ -35,6 +35,10 @@ def load_dotenv_if_present(path: Path = None) -> bool:
 # (see pgdb.save_setting(encrypt=True)), never written back to config.json on disk.
 SECRET_KEYS = {"nvidia_api_key"}
 
+# Every OCR engine src/ocr.py can build. Kept beside the validation that uses it so the
+# two cannot drift apart again.
+OCR_PROVIDERS = ("paddle", "tesseract", "indic")
+
 
 class Config:
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH):
@@ -47,7 +51,10 @@ class Config:
             "chunk_overlap": 250,
             "ocr_mode": "auto",        # auto | always | never
             "ocr_min_chars": 40,        # in auto mode, OCR a page whose text layer has fewer chars than this
-            "ocr_provider": "paddle",   # paddle | tesseract
+            # paddle | tesseract | indic. Default tesseract: PaddleOCR ships no Devanagari
+            # models in this install, so `paddle` only ever degraded to Tesseract anyway,
+            # logging an ERROR on the way. `indic` is the self-hosted microservice.
+            "ocr_provider": "tesseract",
             "max_upload_mb": 50,        # reject uploads larger than this
             # Parallel enrichment calls. 1 by default: the global request throttle in
             # enricher already caps the rate, so extra workers only queue on it. Raise it
@@ -86,8 +93,17 @@ class Config:
         self.ocr_mode = ocr_mode if ocr_mode in ("auto", "always", "never") else "auto"
         self.ocr_min_chars = int(os.getenv("PDFSPECS_OCR_MIN_CHARS", self.settings.get("ocr_min_chars", 40)))
         
-        ocr_provider = os.getenv("PDFSPECS_OCR_PROVIDER", self.settings.get("ocr_provider", "paddle")).lower()
-        self.ocr_provider = ocr_provider if ocr_provider in ("paddle", "tesseract") else "paddle"
+        # Validated here AND in ocr.get_ocr_provider, so this list has to include every
+        # provider that one knows about. It did not include `indic`, so setting
+        # PDFSPECS_OCR_PROVIDER=indic was silently rewritten to `paddle` — the run used
+        # the wrong engine with nothing logged. An unknown value now says so.
+        ocr_provider = os.getenv(
+            "PDFSPECS_OCR_PROVIDER", self.settings.get("ocr_provider", "tesseract")).lower().strip()
+        if ocr_provider not in OCR_PROVIDERS:
+            print(f"Warning: unknown PDFSPECS_OCR_PROVIDER={ocr_provider!r}; using "
+                  f"'tesseract'. Valid values: {', '.join(OCR_PROVIDERS)}")
+            ocr_provider = "tesseract"
+        self.ocr_provider = ocr_provider
         
         self.max_upload_mb = int(os.getenv("PDFSPECS_MAX_UPLOAD_MB", self.settings.get("max_upload_mb", 50)))
         self.enrich_concurrency = max(1, int(os.getenv("PDFSPECS_ENRICH_CONCURRENCY", self.settings.get("enrich_concurrency", 4))))

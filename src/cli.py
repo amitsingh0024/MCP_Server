@@ -128,6 +128,34 @@ def cmd_enrich(args) -> int:
     return 0
 
 
+def cmd_embed(args) -> int:
+    """Stage 1.5: backfill vectors for chunks stored text-only after a provider failure."""
+    org = _org()
+    pending, total = pgdb.count_pending_embedding(org)
+    if not pending:
+        print(f"Nothing to embed ({total} chunks, all have vectors).")
+        return 0
+
+    target = pending if args.limit is None else min(pending, args.limit)
+    print(f"Embedding {target} of {pending} chunks with no vectors ({total} total)...")
+
+    def progress(done):
+        print(f"\r  {done}/{target}  ({100 * done / max(1, target):.0f}%)", end="", flush=True)
+
+    try:
+        done = ingest.run_embedding_pass(org, limit=args.limit, progress_cb=progress)
+    except KeyboardInterrupt:
+        print("\nStopped — committed vectors are kept; rerun to resume.")
+        return 0
+    except enricher.APIKeyMissingError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+
+    remaining, _ = pgdb.count_pending_embedding(org)
+    print(f"\nEmbedded {done} chunk(s). {remaining} still pending.")
+    return 0
+
+
 def cmd_ls(args) -> int:
     docs = pgdb.list_documents(_org())
     if not docs:
@@ -193,6 +221,9 @@ def cmd_info(args) -> int:
     pending, total = pgdb.count_pending_enrichment(org)
     enriched = total - pending
     print(f"  chunks           {total} stored (searchable)")
+    no_vec, _ = pgdb.count_pending_embedding(org)
+    print(f"  embeddings       {total - no_vec}/{total} done"
+          + (f" — {no_vec} pending, run `embed`" if no_vec else ""))
     print(f"  enrichment       {enriched}/{total} done"
           + (f" — {pending} pending, run `enrich`" if pending else ""))
     print("\n  migrations:")
@@ -225,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-enrich", action="store_true",
                     help="don't backfill enrichment while the queue is idle")
     sp.set_defaults(func=cmd_worker)
+
+    sp = sub.add_parser("embed", help="backfill embeddings for chunks stored text-only")
+    sp.add_argument("-n", "--limit", type=int, default=None,
+                    help="embed at most this many chunks, then stop")
+    sp.set_defaults(func=cmd_embed)
 
     sp = sub.add_parser("enrich", help="backfill LLM summaries + entities (stage 2)")
     sp.add_argument("-n", "--limit", type=int, default=None,

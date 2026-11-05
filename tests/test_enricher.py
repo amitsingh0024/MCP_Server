@@ -175,6 +175,13 @@ class TestEmbeddingBatchAlignment(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"PDFSPECS_EMBEDDING_BACKEND": "nvidia"})
         env.start()
         self.addCleanup(env.stop)
+        # Pinned, because this class is about realigning a SPLIT batch and that needs
+        # several windows in one request to mean anything. The shipped default is 1 (the
+        # provider 500s on multi-input requests), so without this the scenario under test
+        # cannot arise and the assertions would silently stop exercising it.
+        batch = mock.patch.object(enricher, "NVIDIA_EMBED_BATCH", 32)
+        batch.start()
+        self.addCleanup(batch.stop)
 
     def _tagged(self, batch) -> mock.Mock:
         """One vector per input window, tagged with that window's first character."""
@@ -283,6 +290,14 @@ class TestRetiredModelHandling(unittest.TestCase):
                             "meta/llama-3.1-8b-instruct")
         self.assertIn("PDFSPECS_NVIDIA_LLM_MODEL", msg)
         self.assertNotIn("PDFSPECS_NVIDIA_EMBEDDING_MODEL", msg)
+
+    def test_embed_batch_defaults_to_one(self):
+        """
+        Multi-input embedding requests 500 on this provider, and every retry fails the
+        same way, so a batched default takes whole documents down. It cost two ingestion
+        runs on 2026-11-05 before being measured.
+        """
+        self.assertEqual(enricher.NVIDIA_EMBED_BATCH, 1)
 
     def test_no_default_model_is_a_known_retired_one(self):
         """Guards against reintroducing a model the provider has already switched off."""

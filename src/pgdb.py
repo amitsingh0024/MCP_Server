@@ -300,6 +300,93 @@ def chunks_pending_enrichment(org_id: str, limit: int = 100) -> list:
         return [{"id": str(r["id"]), "text_content": r["text_content"]} for r in rows]
 
 
+# =====================================================================
+# Embedding backfill (stage 1.5) — chunks stored text-only after a provider failure
+# =====================================================================
+def chunks_pending_embedding(org_id: str, limit: int = 100) -> list:
+    """
+    Chunks that have no embedding vectors at all.
+
+    Ingestion stores a chunk's text even when the embedding provider is unavailable — the
+    alternative was discarding the whole document, which on this corpus meant throwing away
+    an hour of OCR because of one transient 5xx. Such a chunk is searchable lexically and
+    waits here for the backfill.
+
+    `embedding_model` is left NULL for these, which is what keeps them out of
+    corpus_embedding_models() and so out of the query/corpus model-match check.
+    """
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, text_content FROM chunks c
+            WHERE org_id = %s
+              AND NOT EXISTS (SELECT 1 FROM chunk_embeddings e WHERE e.chunk_id = c.id)
+            ORDER BY created_at, id
+            LIMIT %s
+            """,
+            (org_id, limit),
+        ).fetchall()
+        return [{"id": str(r["id"]), "text_content": r["text_content"]} for r in rows]
+
+
+def count_pending_embedding(org_id: str) -> tuple:
+    """Return (chunks with no vectors, total chunks) for the org."""
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT count(*) FILTER (
+                       WHERE NOT EXISTS (SELECT 1 FROM chunk_embeddings e
+                                         WHERE e.chunk_id = c.id)) AS pending,
+                   count(*) AS total
+            FROM chunks c WHERE org_id = %s
+            """,
+            (org_id,),
+        ).fetchone()
+        return int(row["pending"]), int(row["total"])
+
+
+def orgs_with_pending_embedding() -> list:
+    """Org ids holding chunks with no vectors (used by the idle worker loop)."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT org_id FROM chunks c
+            WHERE NOT EXISTS (SELECT 1 FROM chunk_embeddings e WHERE e.chunk_id = c.id)
+            """
+        ).fetchall()
+        return [str(r["org_id"]) for r in rows]
+
+
+def save_chunk_embeddings(org_id: str, chunk_id: str, embeddings: list,
+                          embedding_model: str) -> int:
+    """
+    Attach window vectors to an already-stored chunk and record the model that made them.
+
+    One transaction, so a chunk never ends up with vectors but no model recorded — that
+    pairing is what the search-side model-match check reads.
+    """
+    vectors = [v for v in (_clean_embedding(e) for e in (embeddings or [])) if v is not None]
+    if not vectors:
+        return 0
+    with connection() as conn:
+        with conn.transaction():
+            for idx, vec in enumerate(vectors):
+                conn.execute(
+                    """
+                    INSERT INTO chunk_embeddings (org_id, chunk_id, window_index, embedding)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (chunk_id, window_index) DO UPDATE
+                        SET embedding = EXCLUDED.embedding
+                    """,
+                    (org_id, chunk_id, idx, np.asarray(vec, dtype=np.float32)),
+                )
+            conn.execute(
+                "UPDATE chunks SET embedding_model = %s WHERE org_id = %s AND id = %s",
+                (embedding_model, org_id, chunk_id),
+            )
+    return len(vectors)
+
+
 def corpus_embedding_models(org_id: str) -> list:
     """Distinct embedding models present in this org's stored chunks."""
     with connection() as conn:

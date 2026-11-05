@@ -126,9 +126,19 @@ EMBED_WINDOW_CHARS = int(os.getenv("PDFSPECS_EMBED_WINDOW_CHARS", "900"))
 EMBED_WINDOW_OVERLAP = int(os.getenv("PDFSPECS_EMBED_WINDOW_OVERLAP", "90"))
 # Windows per forward pass (local) / per request (nvidia).
 EMBED_BATCH_SIZE = int(os.getenv("PDFSPECS_EMBED_BATCH_SIZE", "16"))
-# Windows per NVIDIA embeddings request. This batching is why the API path is ~26x faster
-# than local inference on this hardware despite the rate-limit throttle.
-NVIDIA_EMBED_BATCH = int(os.getenv("PDFSPECS_NVIDIA_EMBED_BATCH", "32"))
+# Windows per NVIDIA embeddings request. ONE, not a batch, and that is measured rather
+# than cautious: nemotron-3.5-embed-1b answers `500 service inference failed` to almost
+# any multi-input request, while single-input requests are reliable.
+#
+#   1 input  x 2,500 chars  ->  200, ten times out of ten
+#   2 inputs x   420 chars  ->  500
+#   32 inputs x    5 chars  ->  500
+#
+# Size is not the trigger (a single 5,310-char input succeeds while 2,655 sometimes
+# fails), so the residual flakiness is the provider's and _post_with_retry absorbs it.
+# At batch 32 every retry failed the same way, which cost two full ingestion runs —
+# ~2 hours of OCR — on 2026-11-05. Raise this only after re-probing the endpoint.
+NVIDIA_EMBED_BATCH = int(os.getenv("PDFSPECS_NVIDIA_EMBED_BATCH", "1"))
 
 
 @dataclass
