@@ -20,10 +20,16 @@ from dataclasses import dataclass
 import requests
 from requests.exceptions import RequestException, HTTPError
 
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    SentenceTransformer = None
+# sentence-transformers is imported LAZILY, inside _get_embedding_model, and must stay
+# that way. Importing it here pulls in torch and transformers, which cost ~226 MB of RSS
+# at import time — on top of ~104 MB for the rest of the app. On a 512 MB instance that
+# left no headroom to parse a PDF, so the hosted service OOMed during startup, before
+# uvicorn could bind a port, and restarted in a loop. Each restart spawned a fresh
+# ingestion worker that claimed pending tasks on boot, which is how one queued document
+# reached attempts=3 in six seconds and collided with a local run.
+#
+# Nothing here needs it: the local embedding backend is the only consumer, and the
+# deployed backend is `nvidia`. Measured with the import deferred: 330 MB -> 108 MB.
 
 logger = logging.getLogger("pdfspecs.enricher")
 
@@ -345,8 +351,15 @@ EMBED_DEVICE = os.getenv("PDFSPECS_EMBED_DEVICE", "").strip()
 
 def _get_embedding_model(model_name: str):
     global _embedding_model_instance
-    if SentenceTransformer is None:
-        raise ImportError("sentence-transformers is required for local embeddings")
+    # Imported here, not at module scope: see the note at the top of this file. This is
+    # the only consumer, and it runs only on the local embedding backend.
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as e:
+        raise ImportError(
+            "sentence-transformers is required for local embeddings. Install it, or set "
+            "PDFSPECS_EMBEDDING_BACKEND=nvidia to use the hosted embedding API."
+        ) from e
 
     if _embedding_model_instance is None:
         with _embedding_model_lock:

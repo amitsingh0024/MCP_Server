@@ -389,5 +389,61 @@ class TestThinkingDisabled(unittest.TestCase):
                 enricher._call_nvidia_llm("text", "key", "model")
 
 
+class TestNoEagerTorchImport(unittest.TestCase):
+    """
+    Importing src.enricher must NOT pull in torch / sentence-transformers.
+
+    The regression this guards: a module-level `from sentence_transformers import
+    SentenceTransformer` cost ~226 MB of RSS at import, taking the whole app from
+    ~104 MB to ~330 MB. On the 512 MB hosted instance that left no headroom to parse a
+    PDF, so the service OOMed during startup -- before uvicorn bound a port -- and
+    restarted in a loop. Each restart started a fresh ingestion worker that claimed
+    pending tasks on boot, so a single queued document hit attempts=3 in six seconds
+    and fought with a local ingest run for the same task.
+
+    It bought nothing: the local embedding backend is the only consumer and the
+    deployed backend is `nvidia`, so torch was loaded on every boot and never called.
+    """
+
+    def test_importing_enricher_does_not_import_torch(self):
+        import subprocess
+        import sys
+        # A subprocess, because torch is already in this process's sys.modules via
+        # other tests -- checking here would pass no matter what enricher does.
+        code = (
+            "import sys; sys.path.insert(0, '.');"
+            "import src.enricher;"
+            "heavy = [m for m in ('torch', 'sentence_transformers', 'transformers')"
+            "         if m in sys.modules];"
+            "print(','.join(heavy))"
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True, cwd=os.path.dirname(os.path.dirname(
+                                 os.path.abspath(__file__))))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        loaded = out.stdout.strip()
+        self.assertEqual(
+            loaded, "",
+            f"src.enricher eagerly imported {loaded!r}. Keep the sentence-transformers "
+            f"import inside _get_embedding_model -- see the note at the top of "
+            f"src/enricher.py.")
+
+    def test_local_backend_still_raises_a_useful_error_without_the_package(self):
+        """Absence must stay a clear message, not an ImportError from deep in a call."""
+        import builtins
+        real_import = builtins.__import__
+
+        def fake(name, *a, **kw):
+            if name == "sentence_transformers":
+                raise ImportError("no module named sentence_transformers")
+            return real_import(name, *a, **kw)
+
+        with mock.patch.object(enricher, "_embedding_model_instance", None), \
+             mock.patch.object(builtins, "__import__", side_effect=fake):
+            with self.assertRaises(ImportError) as ctx:
+                enricher._get_embedding_model("some-model")
+        self.assertIn("PDFSPECS_EMBEDDING_BACKEND", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

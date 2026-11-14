@@ -23,3 +23,8 @@ scratch_*.py
 # OS
 .DS_Store
 .env.hosted
+
+# Timestamped .env backups (hold live credentials). Deliberately NOT `.env.*`,
+# which would also swallow the tracked .env.local.example.
+.env.bak
+.env.bak.*
