@@ -396,13 +396,14 @@ class TestNoEagerTorchImport(unittest.TestCase):
     The regression this guards: a module-level `from sentence_transformers import
     SentenceTransformer` cost ~226 MB of RSS at import, taking the whole app from
     ~104 MB to ~330 MB. On the 512 MB hosted instance that left no headroom to parse a
-    PDF, so the service OOMed during startup -- before uvicorn bound a port -- and
-    restarted in a loop. Each restart started a fresh ingestion worker that claimed
-    pending tasks on boot, so a single queued document hit attempts=3 in six seconds
-    and fought with a local ingest run for the same task.
+    PDF, so the service ran out of memory during startup -- before uvicorn bound a port,
+    which showed up as "No open ports detected" -- and the platform restarted it in a
+    loop.
 
     It bought nothing: the local embedding backend is the only consumer and the
     deployed backend is `nvidia`, so torch was loaded on every boot and never called.
+    Deferring the import took the service to 108 MB and it then stayed up across 12
+    consecutive health probes.
     """
 
     def test_importing_enricher_does_not_import_torch(self):

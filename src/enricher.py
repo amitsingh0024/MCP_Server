@@ -22,14 +22,15 @@ from requests.exceptions import RequestException, HTTPError
 
 # sentence-transformers is imported LAZILY, inside _get_embedding_model, and must stay
 # that way. Importing it here pulls in torch and transformers, which cost ~226 MB of RSS
-# at import time — on top of ~104 MB for the rest of the app. On a 512 MB instance that
-# left no headroom to parse a PDF, so the hosted service OOMed during startup, before
-# uvicorn could bind a port, and restarted in a loop. Each restart spawned a fresh
-# ingestion worker that claimed pending tasks on boot, which is how one queued document
-# reached attempts=3 in six seconds and collided with a local run.
+# at import time — on top of ~104 MB for the rest of the app. On the 512 MB hosted
+# instance that left no headroom to parse a PDF, so the service ran out of memory during
+# startup, before uvicorn could bind a port ("No open ports detected" in the deploy log),
+# and the platform restarted it in a loop.
 #
 # Nothing here needs it: the local embedding backend is the only consumer, and the
-# deployed backend is `nvidia`. Measured with the import deferred: 330 MB -> 108 MB.
+# deployed backend is `nvidia`, so torch was loaded on every boot and never called.
+# Measured with the import deferred: 330 MB -> 108 MB, and the deployed service then
+# held steady across 12 consecutive health probes instead of restarting.
 
 logger = logging.getLogger("pdfspecs.enricher")
 
