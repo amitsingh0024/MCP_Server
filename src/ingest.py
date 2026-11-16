@@ -134,12 +134,21 @@ def process_task(task: dict) -> bool:
         local_path = Path(tmpdir) / storage.safe_filename(filename)
         storage.download_to_path(storage_key, local_path)
 
-        # 2. Parse.
-        def parse_cb(cur, total):
-            _progress(task_id, "Parsing PDF",
-                      f"Extracting page {cur} of {total}", int(10 * cur / max(1, total)))
+        # 2. Parse. A markdown source skips the text-layer/OCR path entirely: these books
+        #    exist as both, and the PDFs were printed from the markdown by a converter
+        #    that mangles Devanagari on the way out (see parser.parse_markdown). Reading
+        #    the markdown is ~0.7s for the whole corpus against ~131 hours of OCR.
+        is_markdown = local_path.suffix.lower() in (".md", ".markdown")
+        phase = "Parsing" if is_markdown else "Parsing PDF"
+        unit = "record" if is_markdown else "page"
 
-        parsed = parser.parse_pdf(local_path, progress_callback=parse_cb)
+        def parse_cb(cur, total):
+            _progress(task_id, phase,
+                      f"Extracting {unit} {cur} of {total}", int(10 * cur / max(1, total)))
+
+        parsed = (parser.parse_markdown(local_path, progress_callback=parse_cb)
+                  if is_markdown
+                  else parser.parse_pdf(local_path, progress_callback=parse_cb))
         sha256 = parsed["sha256"]
 
         # 3. Diff-aware skip (per org).

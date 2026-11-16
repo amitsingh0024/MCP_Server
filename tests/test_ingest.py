@@ -218,3 +218,52 @@ class TestEmbeddingBackfill(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceFormatDispatch(unittest.TestCase):
+    """
+    These books exist as both PDF and markdown, and the markdown is the source the PDFs
+    were printed from. Sending a .md file down the PDF path would hand pymupdf a file it
+    cannot open; sending a .pdf down the markdown path would index its raw bytes. The
+    extension is what picks, so pin it.
+    """
+
+    def _run(self, stored_name):
+        calls = {"pdf": 0, "md": 0}
+
+        def parse_pdf(path, progress_callback=None):
+            calls["pdf"] += 1
+            return {"sha256": "abc", "size_bytes": 1, "pages": []}
+
+        def parse_markdown(path, progress_callback=None, page_map=None):
+            calls["md"] += 1
+            return {"sha256": "abc", "size_bytes": 1, "pages": []}
+
+        with mock.patch.object(ingest, "_org_provider_settings") as settings, \
+             mock.patch.object(ingest.storage, "safe_filename", return_value=stored_name), \
+             mock.patch.object(ingest.storage, "download_to_path"), \
+             mock.patch.object(ingest.parser, "parse_pdf", side_effect=parse_pdf), \
+             mock.patch.object(ingest.parser, "parse_markdown", side_effect=parse_markdown), \
+             mock.patch.object(ingest.chunker, "chunk_document", return_value=[]), \
+             mock.patch.object(ingest.pgdb, "get_document_by_sha256", return_value=None), \
+             mock.patch.object(ingest.pgdb, "add_document", return_value="doc-1"), \
+             mock.patch.object(ingest.pgdb, "update_task"), \
+             mock.patch.object(ingest.pgdb, "update_task_progress"), \
+             mock.patch.object(ingest.pgdb, "add_chunks_bulk", return_value=[]), \
+             mock.patch.object(ingest, "_embed_chunks", return_value=([], 0)):
+            settings.return_value.resolved_embedding_model.return_value = "some/model"
+            ingest.process_task({"id": 1, "org_id": "org-1", "storage_key": "k",
+                                 "original_filename": stored_name, "attempts": 0})
+        return calls
+
+    def test_pdf_goes_to_the_pdf_parser(self):
+        self.assertEqual(self._run("book.pdf"), {"pdf": 1, "md": 0})
+
+    def test_markdown_goes_to_the_markdown_parser(self):
+        self.assertEqual(self._run("book.md"), {"pdf": 0, "md": 1})
+
+    def test_markdown_long_extension_is_recognised(self):
+        self.assertEqual(self._run("book.markdown"), {"pdf": 0, "md": 1})
+
+    def test_extension_matching_ignores_case(self):
+        self.assertEqual(self._run("BOOK.MD"), {"pdf": 0, "md": 1})
