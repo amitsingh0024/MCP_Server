@@ -101,11 +101,31 @@ def main():
     print(f"embed batch : {enricher.NVIDIA_EMBED_BATCH} window(s) per request")
     print()
 
-    # ---- queue -----------------------------------------------------------
+    # ---- queue, already claimed by us ------------------------------------
+    # Inserted straight into 'processing' with our own worker id, rather than
+    # add_task() + get_next_task(). Those are two statements, and a hosted worker
+    # polling the queue can claim the row in the gap between them -- then it ingests
+    # the book with whatever OCR configuration that environment happens to have,
+    # which on the deployed service means no OCR endpoint and a silent fall back to
+    # Tesseract. Inserting it pre-claimed means no other worker ever sees it pending.
+    #
+    # Nothing else needs to change: the 15-minute lease plus this runner's per-page
+    # progress writes already stop another worker reclaiming it mid-run.
     data = path.read_bytes()
     key = storage.upload_bytes(args.org, path.name, data)
-    task_id = pgdb.add_task(args.org, key, path.name)
-    print(f"queued task {task_id}  ({len(data)//1024} KB)\n")
+    me = f"runbook:{os.getpid()}"
+    with pgdb.connection() as conn:
+        row = conn.execute(
+            """INSERT INTO tasks (org_id, storage_key, original_filename,
+                                  status, attempts, locked_by)
+               VALUES (%s, %s, %s, 'processing', 1, %s) RETURNING id""",
+            (args.org, key, path.name, me),
+        ).fetchone()
+        task_id = int(row["id"])
+        conn.commit()
+    task = {"id": task_id, "org_id": args.org, "storage_key": key,
+            "original_filename": path.name, "attempts": 0}
+    print(f"queued task {task_id} (pre-claimed by {me}, {len(data)//1024} KB)\n")
 
     # ---- stage 1 with a live bar ----------------------------------------
     bar = Bar("ingest")
@@ -133,11 +153,8 @@ def main():
     ingest._progress = patched
     t0 = time.time()
     try:
-        task = pgdb.get_next_task(worker_id=f"runbook:{os.getpid()}")
-        if not task or int(task["id"]) != task_id:
-            bar.done(f"expected task {task_id}, got {task and task['id']} "
-                     f"-- another worker may have claimed it")
-            return 1
+        # No get_next_task(): the row above was inserted already claimed, so there is
+        # no pending window for another worker to win.
         ok = ingest.process_task(task)
     finally:
         ingest._progress = original_progress
