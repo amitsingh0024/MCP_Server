@@ -257,3 +257,79 @@ class TestPageIsolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParseMarkdown(unittest.TestCase):
+    """
+    parse_markdown must return exactly what parse_pdf returns, because ingest.process_task
+    consumes the two interchangeably and the chunker reads `pages` positionally.
+    """
+
+    BOOK = (
+        "# Sushruta\n\n"
+        "Front matter that belongs with the first record.\n\n"
+        "### Annapana vidhi — Shloka 292.0\n\n"
+        "**Sanskrit:** वेणोः करीराः कफला मधुरा रसपाकतः\n\n"
+        "**Meaning:** The tender sprouts of Venu generate Kapha.\n\n"
+        "### Annapana vidhi — Shloka 293.0\n\n"
+        "**Sanskrit:** उत्पलादिकषायाद्याश्चन्दनोशीरसंयुताः\n\n"
+        "**Meaning:** Cooling and sweet, they subdue fever.\n"
+    )
+
+    def _write(self, text, name="book.md"):
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="pdfspecs-md-"))
+        p = d / name
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_returns_the_same_keys_as_parse_pdf(self):
+        out = parser.parse_markdown(self._write(self.BOOK))
+        self.assertEqual(set(out), {"sha256", "filename", "size_bytes", "pages"})
+        self.assertEqual(out["filename"], "book.md")
+        self.assertEqual(len(out["sha256"]), 64)
+        self.assertTrue(all({"page_num", "text"} == set(p) for p in out["pages"]))
+
+    def test_one_page_per_record_and_front_matter_joins_the_first(self):
+        out = parser.parse_markdown(self._write(self.BOOK))
+        self.assertEqual([p["page_num"] for p in out["pages"]], [1, 2])
+        # Front matter must not become a page of its own, or every page_map key would be
+        # off by one against the record index it is supposed to address.
+        self.assertIn("Front matter", out["pages"][0]["text"])
+        self.assertIn("Shloka 292.0", out["pages"][0]["text"])
+        self.assertIn("Shloka 293.0", out["pages"][1]["text"])
+
+    def test_page_map_overrides_the_ordinal(self):
+        out = parser.parse_markdown(self._write(self.BOOK), page_map={0: 17, 1: 17})
+        # Both records sit on printed page 17; repeated page numbers are expected and the
+        # chunker's offset table handles them.
+        self.assertEqual([p["page_num"] for p in out["pages"]], [17, 17])
+
+    def test_chunker_consumes_the_output_and_keeps_citations(self):
+        from src import chunker
+        out = parser.parse_markdown(self._write(self.BOOK), page_map={0: 17, 1: 18})
+        chunks = chunker.chunk_document(out["pages"], 2500, 250)
+        self.assertTrue(chunks)
+        self.assertTrue(all(c["page_start"] in (17, 18) for c in chunks))
+        # The verse reference travels inside the text, which is the real citation.
+        self.assertTrue(any("Shloka 292.0" in c["text_content"] for c in chunks))
+
+    def test_file_without_records_still_parses_as_one_page(self):
+        with self.assertLogs("pdfspecs.parser", level="WARNING"):
+            out = parser.parse_markdown(self._write("Just prose, no records here.\n"))
+        self.assertEqual(len(out["pages"]), 1)
+        self.assertEqual(out["pages"][0]["page_num"], 1)
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            parser.parse_markdown(Path("/nonexistent/none.md"))
+
+    def test_progress_callback_is_throttled(self):
+        many = "".join(f"### Entry — Shloka {i}.0\n\nBody text {i}\n\n" for i in range(500))
+        calls = []
+        parser.parse_markdown(self._write(many),
+                              progress_callback=lambda c, t: calls.append((c, t)))
+        # Each call writes progress to the database in ingest, so 500 records must not
+        # produce 500 writes.
+        self.assertLessEqual(len(calls), parser._MD_PROGRESS_STEPS + 2)
+        self.assertEqual(calls[-1][0], calls[-1][1])
