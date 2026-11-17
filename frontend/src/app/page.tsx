@@ -374,14 +374,14 @@ function IngestPanel({ onIngest }: { onIngest: () => void }) {
     <div className="max-w-xl">
       <div className="mb-6 space-y-1">
         <h2 className="text-base font-medium text-white">Ingest Document</h2>
-        <p className="text-sm text-zinc-500">Upload a PDF to parse, chunk, and embed into the graph.</p>
+        <p className="text-sm text-zinc-500">Upload a PDF or markdown file to parse, chunk, and embed into the graph.</p>
       </div>
       
       <form onSubmit={handleUpload} className="space-y-6">
         <div className="relative group">
           <input 
             type="file" 
-            accept=".pdf" 
+            accept=".pdf,.md,.markdown" 
             onChange={(e) => setFile(e.target.files?.[0] || null)} 
             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
           />
@@ -397,7 +397,7 @@ function IngestPanel({ onIngest }: { onIngest: () => void }) {
                 </div>
               ) : (
                 <div>
-                  <div className="text-sm font-medium text-zinc-300">Click or drag PDF here</div>
+                  <div className="text-sm font-medium text-zinc-300">Click or drag a PDF or markdown file here</div>
                   <div className="text-xs text-zinc-500 mt-1">Up to 50MB per file</div>
                 </div>
               )}
