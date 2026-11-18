@@ -18,6 +18,7 @@ import socket
 import shutil
 import logging
 import tempfile
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -73,6 +74,11 @@ def _org_provider_settings(org_id: str) -> enricher.ProviderSettings:
 
 
 def _progress(task_id, phase: str, detail: str, progress: int):
+    # Also beats the worker heartbeat. A single book can occupy the loop for an hour, so
+    # a heartbeat updated only once per loop iteration would read as dead for most of a
+    # healthy run; this fires per page and per embedding batch.
+    _worker_state["heartbeat"] = time.time()
+    _worker_state["task_id"] = task_id
     pgdb.update_task_progress(task_id, json.dumps(
         {"phase": phase, "detail": detail, "progress": progress}))
 
@@ -151,14 +157,26 @@ def process_task(task: dict) -> bool:
                   else parser.parse_pdf(local_path, progress_callback=parse_cb))
         sha256 = parsed["sha256"]
 
-        # 3. Diff-aware skip (per org).
+        # 3. Diff-aware skip (per org) — but only for a document that actually holds
+        #    chunks. The row below is created BEFORE chunking, so an ingest killed in
+        #    between (container restart, OOM, lost lease) leaves an empty one. Keying the
+        #    skip on mere existence meant the retry reported "already ingested" over a
+        #    book with nothing in it, permanently, and the only symptom was a search that
+        #    came up short. An empty row is abandoned work: drop it and ingest properly.
         existing = pgdb.get_document_by_sha256(org_id, sha256)
         if existing:
-            logger.info("Doc already ingested for org (sha match); skipping. doc=%s", existing["id"])
-            pgdb.update_task(task_id, "completed", document_id=str(existing["id"]),
-                             progress_info=json.dumps({"phase": "Completed",
-                                 "detail": "Skipped (already ingested)", "progress": 100}))
-            return True
+            n_chunks = pgdb.document_chunk_count(org_id, str(existing["id"]))
+            if n_chunks:
+                logger.info("Doc already ingested for org (sha match, %d chunks); "
+                            "skipping. doc=%s", n_chunks, existing["id"])
+                pgdb.update_task(task_id, "completed", document_id=str(existing["id"]),
+                                 progress_info=json.dumps({"phase": "Completed",
+                                     "detail": "Skipped (already ingested)", "progress": 100}))
+                return True
+            logger.warning("Found an empty document row for %s (doc=%s) left by an "
+                           "abandoned ingest; deleting it and re-ingesting.",
+                           filename, existing["id"])
+            pgdb.delete_document(org_id, str(existing["id"]))
 
         # 4. Create the document row.
         doc_id = pgdb.add_document(org_id, filename, sha256, parsed["size_bytes"])
@@ -364,6 +382,27 @@ def run_enrichment_pass(org_id: str, limit: int = None, progress_cb=None) -> int
     return done
 
 
+# ---------------------------------------------------------------------------
+# Worker liveness
+# ---------------------------------------------------------------------------
+# The worker is a daemon thread inside the API process, so uvicorn keeps answering
+# after it dies. /health returned a flat {"status": "ok"} through a worker that had
+# been dead for hours, while 13 tasks sat in 'pending' and the only visible symptom
+# was a queue that never moved. These let /health report the thread, not the web server.
+_worker_state = {"started_at": None, "heartbeat": None, "iterations": 0, "task_id": None}
+
+# How often the loop re-sweeps for tasks abandoned by a worker that died mid-book.
+# Without this the sweep ran only at startup, so a task whose owner vanished while this
+# worker was already running stayed 'processing' forever — observed stranded for an hour
+# against a 15-minute lease, and only a container restart freed it.
+_SWEEP_INTERVAL_SEC = float(os.getenv("PDFSPECS_STUCK_SWEEP_SEC", "300"))
+
+
+def worker_state() -> dict:
+    """Snapshot of the worker thread's progress, for /health. Never raises."""
+    return dict(_worker_state)
+
+
 def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: bool = True):
     """
     Poll the queue and process tasks (stage 1). When the queue is idle, spend the time
@@ -373,7 +412,6 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
     `enrich` governs only the LLM stage; the embedding backfill always runs, since a
     corpus missing vectors is more broken than one missing summaries.
     """
-    import time
     me = worker_id()
     logger.info("Starting ingestion worker %s (enrichment %s)...",
                 me, "enabled" if enrich else "disabled")
@@ -381,59 +419,96 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
     # starting a second worker no longer requeues (and deletes the document of) a task
     # the first one is actively processing.
     pgdb.reset_stuck_tasks(worker_id=me)
+    _worker_state["started_at"] = time.time()
+    _worker_state["heartbeat"] = time.time()
+    last_sweep = time.monotonic()
     run_count = 0
     while True:
-        task = pgdb.get_next_task(worker_id=me)
-        if task:
-            process_task(task)
-            run_count += 1
-            if max_runs and run_count >= max_runs:
-                break
-            continue
-
-        # Queue empty. Backfill embeddings FIRST: they are the search-critical half, they
-        # need no LLM, and a corpus missing vectors is more broken than one missing
-        # summaries. Runs regardless of `enrich`, which governs only the LLM stage.
-        worked = False
+        _worker_state["heartbeat"] = time.time()
+        _worker_state["iterations"] += 1
+        # EVERY iteration is wrapped. This loop used to run bare, so one transient error
+        # from get_next_task — a pooled connection dropped while the instance idled, say
+        # — propagated out of run_worker_loop and ended the daemon thread. Silently: the
+        # API kept serving, /health kept returning ok, and the queue simply stopped
+        # draining until someone restarted the container. Losing one iteration to a
+        # logged error is always better than losing the worker.
         try:
-            orgs = pgdb.orgs_with_pending_embedding()
-        except Exception as e:
-            logger.error("Could not list orgs pending embedding: %s", e)
-            orgs = []
-        for org in orgs:
-            try:
-                if run_embedding_pass(org, limit=200):
-                    worked = True
+            # Re-sweep abandoned tasks periodically, not just at startup: a worker that
+            # dies mid-book leaves its task 'processing' with a lease nothing else
+            # reclaims while this worker is already running.
+            #
+            # Deliberately twice the lease, unlike the startup sweep. Reclaiming a task
+            # also DELETES its partial document, so stealing one from a worker that is
+            # merely slow destroys live work. The heartbeat is written per embedding
+            # batch, and on a CPU-starved instance a 32-chunk batch has been measured at
+            # ~10 minutes — close enough to the 15-minute lease to be dangerous when the
+            # sweep runs every few minutes instead of once at boot. At startup the
+            # ordinary lease is still right: nothing of ours is in flight yet.
+            if time.monotonic() - last_sweep >= _SWEEP_INTERVAL_SEC:
+                last_sweep = time.monotonic()
+                freed = pgdb.reset_stuck_tasks(
+                    worker_id=me, lease_minutes=pgdb.TASK_LEASE_MINUTES * 2)
+                if freed:
+                    logger.warning("Requeued %d task(s) abandoned by a dead worker.", freed)
+
+            task = pgdb.get_next_task(worker_id=me)
+            if task:
+                process_task(task)
+                run_count += 1
+                _worker_state["task_id"] = None
+                if max_runs and run_count >= max_runs:
                     break
-            except Exception as e:
-                logger.error("Embedding backfill failed for org %s: %s", org, e)
-        if worked:
-            continue
+                continue
 
-        # Then enrichment, in small slices so a newly queued document is picked up
-        # promptly rather than waiting for a whole corpus to be enriched.
-        if enrich:
-            # Per-org error handling, INSIDE the loop. With the handler outside it, the
-            # first org lacking an NVIDIA key aborted the whole scan — and since
-            # orgs_with_pending_enrichment() is a DISTINCT with no ORDER BY, that starved
-            # every other tenant intermittently, depending on row order.
-            try:
-                orgs = pgdb.orgs_with_pending_enrichment()
-            except Exception as e:
-                logger.error("Could not list orgs pending enrichment: %s", e)
-                orgs = []
-
+            # Queue empty. Backfill embeddings FIRST: they are the search-critical half, they
+            # need no LLM, and a corpus missing vectors is more broken than one missing
+            # summaries. Runs regardless of `enrich`, which governs only the LLM stage.
             worked = False
+            try:
+                orgs = pgdb.orgs_with_pending_embedding()
+            except Exception as e:
+                logger.error("Could not list orgs pending embedding: %s", e)
+                orgs = []
             for org in orgs:
                 try:
-                    if run_enrichment_pass(org, limit=25):
+                    if run_embedding_pass(org, limit=200):
                         worked = True
                         break
-                except enricher.APIKeyMissingError:
-                    continue               # this org has no key; others may
                 except Exception as e:
-                    logger.error("Enrichment pass failed for org %s: %s", org, e)
-            if not worked:
+                    logger.error("Embedding backfill failed for org %s: %s", org, e)
+            if worked:
+                continue
+
+            # Then enrichment, in small slices so a newly queued document is picked up
+            # promptly rather than waiting for a whole corpus to be enriched.
+            if enrich:
+                # Per-org error handling, INSIDE the loop. With the handler outside it, the
+                # first org lacking an NVIDIA key aborted the whole scan — and since
+                # orgs_with_pending_enrichment() is a DISTINCT with no ORDER BY, that starved
+                # every other tenant intermittently, depending on row order.
+                try:
+                    orgs = pgdb.orgs_with_pending_enrichment()
+                except Exception as e:
+                    logger.error("Could not list orgs pending enrichment: %s", e)
+                    orgs = []
+
+                worked = False
+                for org in orgs:
+                    try:
+                        if run_enrichment_pass(org, limit=25):
+                            worked = True
+                            break
+                    except enricher.APIKeyMissingError:
+                        continue               # this org has no key; others may
+                    except Exception as e:
+                        logger.error("Enrichment pass failed for org %s: %s", org, e)
+                if not worked:
+                    time.sleep(interval_sec)
+            else:
                 time.sleep(interval_sec)
-        else:
+        except Exception:
+            # Anything that escaped the inner handlers: a dropped connection, a pooler
+            # restart, a provider client raising something unexpected. Log it with the
+            # traceback and take the next pass. The thread must outlive the error.
+            logger.exception("Worker iteration failed; continuing.")
             time.sleep(interval_sec)
