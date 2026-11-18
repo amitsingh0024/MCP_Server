@@ -281,7 +281,11 @@ function DocumentsPanel() {
             {tasks.map(t => {
               const p = (function() { try { return JSON.parse(t.progress_info || "{}"); } catch { return {}; } })();
               const pct = p.progress != null ? Math.round(p.progress) : 0;
-              const statusMsg = p.status || t.status;
+              // The worker writes {phase, detail, progress} — there is no `status` key,
+              // so `p.status` was always undefined and this line silently fell through
+              // to the bare task status. "Embedding 64/1025 chunks" sat in the database
+              // the whole time while the dashboard showed only "processing".
+              const statusMsg = [p.phase, p.detail].filter(Boolean).join(" — ") || t.status;
               return (
                 <Card key={t.id} className="p-4 flex flex-col gap-3">
                   <div className="flex justify-between items-start">
