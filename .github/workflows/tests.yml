@@ -1,0 +1,68 @@
+# The Python suite had never run in CI. The only checks on a pull request were Vercel
+# (which builds the frontend) and CodeRabbit (which skips itself on this repo), so a
+# change could break every backend test and still show a green tick.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes the run in flight for the same ref; no point finishing a run
+# whose commit is already stale.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the Dockerfile and the local venv use. Pinned rather than
+        # "3.x": the deployment is not a moving target, so CI should not be either.
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      # Guards the lazy-import contract that keeps the 512MB deployment alive: importing
+      # src.enricher must not drag in torch. There is a unit test for this, but it can
+      # only prove the negative where torch is installed — here it is not, so assert the
+      # weaker, still-useful thing: the app imports at all without the ML extras.
+      - name: App imports without the optional ML engines
+        run: python -c "import src.server, src.ingest, src.enricher, src.parser; print('ok')"
+
+      - name: Run the suite
+        run: python -m unittest discover -s tests -v
+
+  frontend:
+    name: frontend typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # Typecheck only. Vercel builds the app on its own; duplicating `next build` here
+      # would just make both slower to tell us the same thing.
+      - run: npx tsc --noEmit -p tsconfig.json
