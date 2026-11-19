@@ -1,0 +1,37 @@
+# Dependencies needed to RUN THE TEST SUITE.
+#
+# This is requirements.txt minus the three heavyweight optional engines:
+#
+#   torch, sentence-transformers  — only the `local` embedding backend uses them, and
+#       enricher imports them lazily precisely so they are never loaded in production
+#       (PDFSPECS_EMBEDDING_BACKEND=nvidia). A test asserts that laziness.
+#   paddleocr                     — an optional OCR engine. get_ocr_provider degrades to
+#       Tesseract when it cannot be constructed, which is itself under test, so running
+#       without it exercises the real fallback rather than mocking it.
+#
+# Leaving them out keeps CI to seconds instead of minutes. If a future change imports
+# one of them at module scope, CI fails with an ImportError — which is the correct and
+# loud outcome, since that would also break the 512MB deployment.
+#
+# httpx (TestClient) and python-dotenv arrive transitively via mcp and pydantic-settings.
+mcp<2.0.0
+pymupdf>=1.24.0
+numpy>=1.24.0
+requests>=2.31.0
+pydantic>=2.0.0
+fastapi>=0.110.0
+python-multipart>=0.0.9
+uvicorn>=0.28.0
+pytesseract>=0.3.10
+# pytesseract imports pandas at module scope (pytesseract.py), so `import pytesseract`
+# fails outright without it. requirements.txt never declares pandas — it is satisfied
+# today only because paddleocr happens to pull it in, which means dropping paddleocr
+# from that file would break Tesseract, the always-available OCR fallback. Declared
+# here explicitly rather than inherited by luck.
+pandas>=2.0.0
+pillow>=10.0.0
+cryptography>=42.0.0
+psycopg[binary]>=3.1
+psycopg-pool>=3.2
+pgvector>=0.3.0
+pyjwt>=2.8.0
