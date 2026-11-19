@@ -48,10 +48,14 @@ async def lifespan(app: FastAPI):
             "PDFSPECS_LOCAL_MODE is set: the admin API skips JWT verification and serves "
             "the implicit local org. Only loopback callers are accepted%s.",
             " (OVERRIDDEN — remote callers allowed)" if auth.allow_remote_local_mode() else "")
-    if os.getenv("PDFSPECS_DISABLE_WORKER", "").lower() not in ("1", "true", "yes"):
+    # .strip() as well as .lower(): a dashboard-set value picks up stray whitespace
+    # easily, and " 1" silently meant "worker enabled" — the opposite of the intent.
+    if os.getenv("PDFSPECS_DISABLE_WORKER", "").strip().lower() not in ("1", "true", "yes"):
         # run_worker_loop runs crash recovery itself, scoped to its own worker id — doing
         # it here as well would sweep with no identity at all.
-        threading.Thread(target=ingest.run_worker_loop, daemon=True).start()
+        global _worker_thread
+        _worker_thread = threading.Thread(target=ingest.run_worker_loop, daemon=True)
+        _worker_thread.start()
         logger.info("Background ingestion worker started.")
     else:
         logger.info("Worker disabled (PDFSPECS_DISABLE_WORKER).")
@@ -118,9 +122,31 @@ def require_api_key(authorization: str = Header(None)) -> str:
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
+# The worker runs as a daemon thread in this process. Holding the handle lets /health
+# answer for the thread rather than for uvicorn, which are not the same thing: the
+# worker has died while the API kept returning 200 for hours, and the queue just stopped.
+_worker_thread: threading.Thread | None = None
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """
+    Liveness for the API *and* the ingestion worker.
+
+    `status` stays "ok" so existing uptime checks and the platform health probe behave
+    as before; a dead worker is reported in `worker.alive`, since failing the whole
+    health check would make the platform recycle a container that still serves requests
+    perfectly well.
+    """
+    disabled = os.getenv("PDFSPECS_DISABLE_WORKER", "").strip().lower() in ("1", "true", "yes")
+    worker = {"enabled": not disabled,
+              "alive": bool(_worker_thread and _worker_thread.is_alive())}
+    if not disabled:
+        try:
+            worker.update(ingest.worker_state())
+        except Exception as e:                       # never let /health fail
+            worker["state_error"] = f"{type(e).__name__}: {e}"
+    return {"status": "ok", "worker": worker}
 
 
 # ---------------------------------------------------------------------------

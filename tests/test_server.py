@@ -98,3 +98,48 @@ class TestDeleteDocument(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHealthReportsTheWorker(unittest.TestCase):
+    """
+    /health returned a flat {"status": "ok"} that spoke only for uvicorn. The ingestion
+    worker is a daemon thread in the same process, so when it died the endpoint stayed
+    green while the queue stopped draining — hours of it, with the only symptom being
+    tasks stuck in 'pending'. The platform probe and any uptime check still need a 200,
+    so the worker's state is reported in the body rather than by failing the check.
+    """
+
+    def test_status_stays_ok_so_the_platform_probe_is_unaffected(self):
+        r = _client("127.0.0.1").get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ok")
+
+    def test_a_dead_worker_thread_is_reported(self):
+        # No lifespan runs in these tests, so no thread was ever started — exactly what
+        # a dead worker looks like from here.
+        with mock.patch.object(server, "_worker_thread", None):
+            body = _client("127.0.0.1").get("/health").json()
+        self.assertIn("worker", body)
+        self.assertFalse(body["worker"]["alive"])
+        self.assertTrue(body["worker"]["enabled"])
+
+    def test_a_live_worker_thread_is_reported(self):
+        alive = mock.Mock()
+        alive.is_alive.return_value = True
+        with mock.patch.object(server, "_worker_thread", alive):
+            body = _client("127.0.0.1").get("/health").json()
+        self.assertTrue(body["worker"]["alive"])
+
+    def test_a_disabled_worker_is_not_reported_as_broken(self):
+        with mock.patch.dict(os.environ, {"PDFSPECS_DISABLE_WORKER": "1"}), \
+             mock.patch.object(server, "_worker_thread", None):
+            body = _client("127.0.0.1").get("/health").json()
+        self.assertFalse(body["worker"]["enabled"])
+
+    def test_the_disable_switch_tolerates_stray_whitespace(self):
+        # Dashboard-set values pick up whitespace easily, and " 1" used to mean the
+        # opposite of what it says: .lower() alone did not match the disable list.
+        with mock.patch.dict(os.environ, {"PDFSPECS_DISABLE_WORKER": " 1 "}), \
+             mock.patch.object(server, "_worker_thread", None):
+            body = _client("127.0.0.1").get("/health").json()
+        self.assertFalse(body["worker"]["enabled"])

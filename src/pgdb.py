@@ -137,6 +137,26 @@ def get_document_by_sha256(org_id: str, sha256: str) -> dict | None:
         return dict(row) if row else None
 
 
+def document_chunk_count(org_id: str, doc_id: str) -> int:
+    """
+    How many chunks a document actually holds.
+
+    The document row is created before chunking, so an ingest that dies in between
+    leaves a row with zero chunks. The sha256 diff-skip keys on that row existing, which
+    made every later upload of the same file report "already ingested" over an empty
+    document — a green tick on a book with nothing in it. Callers use this to tell a
+    finished document from an abandoned one.
+    """
+    if not is_valid_uuid(str(doc_id)):
+        return 0
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM chunks WHERE org_id = %s AND document_id = %s",
+            (org_id, doc_id),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+
 def list_documents(org_id: str) -> list:
     with connection() as conn:
         rows = conn.execute(

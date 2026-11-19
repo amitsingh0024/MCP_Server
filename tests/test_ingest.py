@@ -16,11 +16,18 @@ import os
 import unittest
 from unittest import mock
 
-from src import ingest, enricher
+from src import ingest, enricher, pgdb
 
 
-class _Stop(Exception):
-    """Breaks run_worker_loop's `while True` at a known point."""
+class _Stop(BaseException):
+    """
+    Breaks run_worker_loop's `while True` at a known point.
+
+    BaseException, not Exception, and that is the whole point: the loop now catches
+    Exception on every iteration so a dropped connection cannot kill the worker thread.
+    A test sentinel deriving from Exception would be swallowed by that handler and spin
+    forever. Deriving from BaseException keeps it outside the contract under test.
+    """
 
 
 class TestEnrichmentFairness(unittest.TestCase):
@@ -267,3 +274,138 @@ class TestSourceFormatDispatch(unittest.TestCase):
 
     def test_extension_matching_ignores_case(self):
         self.assertEqual(self._run("BOOK.MD"), {"pdf": 0, "md": 1})
+
+
+class TestWorkerLoopSurvivesErrors(unittest.TestCase):
+    """
+    The worker is a daemon thread inside the API process. When an exception escaped the
+    loop the thread ended silently: uvicorn kept serving, /health kept returning ok, and
+    the queue simply stopped draining until someone restarted the container. Observed in
+    production with 13 tasks pending and a warm instance answering /health in 0.13s.
+    """
+
+    def test_a_transient_poll_failure_does_not_kill_the_loop(self):
+        # First poll blows up the way a dropped pooled connection does; the loop must
+        # take the next pass rather than end.
+        polls = [ConnectionError("server closed the connection unexpectedly"), _Stop()]
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=polls) as poll, \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        self.assertEqual(poll.call_count, 2,
+                         "the loop must poll again after a transient failure")
+
+    def test_a_failure_inside_process_task_does_not_kill_the_loop(self):
+        task = {"id": 1, "org_id": "o", "storage_key": "k", "original_filename": "f.md"}
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=[task, _Stop()]), \
+             mock.patch.object(ingest, "process_task",
+                               side_effect=RuntimeError("boom")) as proc, \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        self.assertEqual(proc.call_count, 1)
+
+    def test_the_loop_records_a_heartbeat(self):
+        ingest._worker_state["iterations"] = 0
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=[None, _Stop()]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding", return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment", return_value=[]), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        state = ingest.worker_state()
+        self.assertIsNotNone(state["started_at"])
+        self.assertIsNotNone(state["heartbeat"])
+        self.assertGreaterEqual(state["iterations"], 1)
+
+
+class TestStuckTaskSweep(unittest.TestCase):
+    def test_stale_tasks_are_reswept_during_the_loop_not_only_at_startup(self):
+        """
+        A worker that dies mid-book leaves its task 'processing'. Nothing reclaimed it
+        while another worker was already running, because the sweep ran once at startup
+        — one task sat stranded for an hour against a 15-minute lease and only a
+        container restart freed it.
+        """
+        clock = iter([0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=2) as sweep, \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=[None, _Stop()]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding", return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment", return_value=[]), \
+             mock.patch("time.monotonic", side_effect=lambda: next(clock, 10_000.0)), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        self.assertGreaterEqual(sweep.call_count, 2,
+                                "expected the startup sweep plus at least one in-loop sweep")
+
+    def test_the_in_loop_sweep_is_more_cautious_than_the_startup_one(self):
+        """
+        Reclaiming a task deletes its partial document, so a sweep that fires every few
+        minutes must not steal from a worker that is merely slow. A 32-chunk embedding
+        batch has been measured at ~10 minutes on a starved instance, against a
+        15-minute lease.
+        """
+        clock = iter([0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0) as sweep, \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=[None, _Stop()]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding", return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment", return_value=[]), \
+             mock.patch("time.monotonic", side_effect=lambda: next(clock, 10_000.0)), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+
+        startup, in_loop = sweep.call_args_list[0], sweep.call_args_list[1]
+        self.assertIsNone(startup.kwargs.get("lease_minutes"),
+                          "startup should use the ordinary lease; nothing of ours is in flight")
+        self.assertGreater(in_loop.kwargs["lease_minutes"], pgdb.TASK_LEASE_MINUTES)
+
+
+class TestEmptyDocumentIsNotTreatedAsIngested(unittest.TestCase):
+    """
+    The document row is created before chunking, so an ingest killed in between leaves
+    one holding zero chunks. The sha256 diff-skip keyed on the row existing, so every
+    later upload of that file reported "already ingested" over an empty document —
+    silently, and permanently.
+    """
+
+    def _process(self, existing, chunk_count):
+        calls = {}
+
+        def add_document(org, filename, sha, size):
+            calls["created"] = True
+            return "doc-new"
+
+        with mock.patch.object(ingest, "_org_provider_settings") as settings, \
+             mock.patch.object(ingest.storage, "safe_filename", return_value="f.md"), \
+             mock.patch.object(ingest.storage, "download_to_path"), \
+             mock.patch.object(ingest.parser, "parse_markdown",
+                               return_value={"sha256": "abc", "size_bytes": 1, "pages": []}), \
+             mock.patch.object(ingest.chunker, "chunk_document", return_value=[]), \
+             mock.patch.object(ingest.pgdb, "get_document_by_sha256", return_value=existing), \
+             mock.patch.object(ingest.pgdb, "document_chunk_count", return_value=chunk_count), \
+             mock.patch.object(ingest.pgdb, "delete_document", return_value=True) as delete, \
+             mock.patch.object(ingest.pgdb, "add_document", side_effect=add_document), \
+             mock.patch.object(ingest.pgdb, "update_task"), \
+             mock.patch.object(ingest.pgdb, "update_task_progress"), \
+             mock.patch.object(ingest.pgdb, "add_chunks_bulk", return_value=[]), \
+             mock.patch.object(ingest, "_embed_chunks", return_value=([], 0)):
+            settings.return_value.resolved_embedding_model.return_value = "m"
+            ingest.process_task({"id": 1, "org_id": "org-1", "storage_key": "k",
+                                 "original_filename": "f.md", "attempts": 0})
+        return calls, delete
+
+    def test_a_document_with_chunks_is_skipped(self):
+        calls, delete = self._process({"id": "doc-old"}, 42)
+        self.assertNotIn("created", calls, "a finished document must not be re-ingested")
+        delete.assert_not_called()
+
+    def test_an_empty_document_is_deleted_and_reingested(self):
+        calls, delete = self._process({"id": "doc-old"}, 0)
+        delete.assert_called_once()
+        self.assertTrue(calls.get("created"),
+                        "an abandoned empty document must be ingested again, not skipped")
