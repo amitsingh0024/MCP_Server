@@ -58,6 +58,21 @@ services:
       # down with it. Measured, not cautious — see src/enricher.py.
       - key: PDFSPECS_NVIDIA_EMBED_BATCH
         value: "1"
+      # --- Stage 2 enrichment throughput ---
+      # Parallel enrichment calls. At 1 (the old default) a 25-chunk slice was 4 LLM
+      # calls back to back, ~26s each, and 26,000 chunks came to roughly 37 hours.
+      # The ceiling is the global throttle in enricher.py, which spaces request STARTS
+      # 1.5s apart across all threads = 40/min; 8 calls of ~26s each start about 18
+      # times a minute, so this stays well inside it and the provider sees no burst.
+      - key: PDFSPECS_ENRICH_CONCURRENCY
+        value: "8"
+      # Chunks per idle-loop enrichment slice. 25 existed so a freshly uploaded document
+      # waited one slice rather than a whole corpus; with the queue drained it is pure
+      # per-slice overhead (two org-scan queries and a pool teardown). At 200 a new
+      # upload waits ~2 minutes at the concurrency above, which is the right trade once
+      # the books are in.
+      - key: PDFSPECS_ENRICH_SLICE
+        value: "200"
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
         sync: false

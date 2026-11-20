@@ -409,3 +409,140 @@ class TestEmptyDocumentIsNotTreatedAsIngested(unittest.TestCase):
         delete.assert_called_once()
         self.assertTrue(calls.get("created"),
                         "an abandoned empty document must be ingested again, not skipped")
+
+
+class TestEmbeddingBackoff(unittest.TestCase):
+    """
+    A dead embeddings endpoint must not keep the idle loop to itself.
+
+    `_post_with_retry` spends 5 attempts at a 45s timeout, so a provider answering
+    `504 service request timed out after 120s` cost ~250s of every pass — and the loop
+    runs the embedding backfill BEFORE enrichment, so that time came out of the one stage
+    that could still make progress. Observed in production with
+    nemotron-3.5-embed-1b: 8,001 chunks stayed unembedded for hours while enrichment
+    crawled at a third of its rate.
+    """
+
+    def setUp(self):
+        ingest._embed_backoff.clear()
+
+    tearDown = setUp
+
+    def _idle_loop(self, iterations, backfill):
+        """
+        Drive `iterations` idle passes of the worker loop, then stop it.
+
+        `backfill` stands in for run_embedding_pass. Returns (backfill mock, enrichment
+        mock) so a test can assert which stage got the loop's time.
+        """
+        tasks = [None] * iterations + [_Stop()]
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=tasks), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding",
+                               return_value=["org-1"]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment",
+                               return_value=["org-1"]), \
+             mock.patch.object(ingest, "run_embedding_pass", **backfill) as embed, \
+             mock.patch.object(ingest, "run_enrichment_pass", return_value=1) as enrich, \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        return embed, enrich
+
+    def test_a_pass_that_embeds_nothing_is_held_off_next_iteration(self):
+        embed, enrich = self._idle_loop(3, {"return_value": 0})
+        # Three idle passes, but the backfill is attempted on the first only: the other
+        # two find the org in cooldown and go straight to enrichment.
+        self.assertEqual(embed.call_count, 1)
+        self.assertEqual(enrich.call_count, 3)
+
+    def test_a_provider_failure_with_no_progress_is_held_off(self):
+        embed, enrich = self._idle_loop(
+            3, {"side_effect": RuntimeError("504 service request timed out")})
+        self.assertEqual(embed.call_count, 1)
+        self.assertEqual(enrich.call_count, 3)
+
+    def test_partial_progress_before_a_failure_is_not_held_off(self):
+        """
+        A pass that embedded 30 chunks before the 31st timed out met a FLAKY provider,
+        not a dead one. Backing off on it would strand the corpus, so the committed
+        chunks count as work and the next pass runs immediately.
+        """
+        def flaky(org_id, limit=None, progress_cb=None):
+            progress_cb(30)
+            raise RuntimeError("read timed out")
+
+        embed, enrich = self._idle_loop(3, {"side_effect": flaky})
+        self.assertEqual(embed.call_count, 3)
+        # Partial progress counts as work, so the backfill keeps the loop and enrichment
+        # is never reached on those iterations.
+        enrich.assert_not_called()
+
+    def test_the_cooldown_doubles_and_is_capped(self):
+        first = ingest._embed_backoff_note_failure("org-1")
+        self.assertEqual(first, ingest._EMBED_BACKOFF_START_SEC)
+        self.assertEqual(ingest._embed_backoff_note_failure("org-1"), first * 2)
+        self.assertEqual(ingest._embed_backoff_note_failure("org-1"), first * 4)
+        for _ in range(20):
+            last = ingest._embed_backoff_note_failure("org-1")
+        self.assertEqual(last, ingest._EMBED_BACKOFF_MAX_SEC)
+
+    def test_a_successful_pass_clears_the_cooldown(self):
+        ingest._embed_backoff_note_failure("org-1")
+        self.assertTrue(ingest._embed_backoff_active("org-1"))
+        ingest._embed_backoff_clear("org-1")
+        self.assertFalse(ingest._embed_backoff_active("org-1"))
+
+    def test_the_cooldown_is_per_org(self):
+        """One tenant's broken key or model must not stall another's backfill."""
+        ingest._embed_backoff_note_failure("org-1")
+        self.assertTrue(ingest._embed_backoff_active("org-1"))
+        self.assertFalse(ingest._embed_backoff_active("org-2"))
+
+    def test_health_reports_a_held_off_backfill(self):
+        """
+        Without this the only symptom of a dead embeddings endpoint is a pending-vector
+        count that never moves. Org ids stay out of it: /health is unauthenticated.
+        """
+        self.assertNotIn("embed_backoff", ingest.worker_state())
+        ingest._embed_backoff_note_failure("org-1")
+        state = ingest.worker_state()
+        self.assertEqual(state["embed_backoff"]["orgs"], 1)
+        self.assertGreater(state["embed_backoff"]["resumes_in_sec"], 0)
+        self.assertNotIn("org-1", repr(state))
+
+
+class TestEnrichmentSliceSize(unittest.TestCase):
+    """
+    The slice was hardcoded at 25. With the queue drained that is pure overhead — two
+    org-scan queries and a thread-pool teardown per 25 chunks — and on a 26,000-chunk
+    corpus it is the difference between hours and most of a day.
+    """
+
+    def test_the_slice_defaults_to_25(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PDFSPECS_ENRICH_SLICE", None)
+            self.assertEqual(ingest._enrich_slice(), 25)
+
+    def test_the_slice_is_env_overridable(self):
+        with mock.patch.dict(os.environ, {"PDFSPECS_ENRICH_SLICE": "200"}):
+            self.assertEqual(ingest._enrich_slice(), 200)
+
+    def test_a_nonsense_slice_floors_at_one(self):
+        with mock.patch.dict(os.environ, {"PDFSPECS_ENRICH_SLICE": "0"}):
+            self.assertEqual(ingest._enrich_slice(), 1)
+
+    def test_the_loop_passes_the_configured_slice(self):
+        with mock.patch.dict(os.environ, {"PDFSPECS_ENRICH_SLICE": "200"}), \
+             mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task",
+                               side_effect=[None, _Stop()]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding",
+                               return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment",
+                               return_value=["org-1"]), \
+             mock.patch.object(ingest, "run_enrichment_pass", return_value=1) as enrich, \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        self.assertEqual(enrich.call_args.kwargs["limit"], 200)
