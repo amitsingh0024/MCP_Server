@@ -60,6 +60,55 @@ def _embed_chunk_batch() -> int:
     return max(1, int(os.getenv("PDFSPECS_EMBED_CHUNK_BATCH", "32")))
 
 
+def _enrich_slice() -> int:
+    """
+    Chunks per idle-loop enrichment slice (PDFSPECS_ENRICH_SLICE).
+
+    Kept small by default so a document queued while the loop is enriching waits one
+    slice, not a whole corpus. Raise it once the queue is drained: the per-slice
+    overhead (two org-scan queries and a pool teardown) then buys nothing.
+    """
+    return max(1, int(os.getenv("PDFSPECS_ENRICH_SLICE", "25")))
+
+
+# How long to leave an org's embedding backfill alone after a pass gets nowhere.
+#
+# A dead provider endpoint is not a fast failure: _post_with_retry spends 5 attempts at a
+# 45s timeout, so ~250s of each loop pass went into a call that could not succeed — taken
+# straight out of the enrichment slice that could. Measured against
+# nemotron-3.5-embed-1b answering `504 service request timed out after 120s` to every
+# single-input request while every other model on the same key answered in under a
+# second: 8,001 chunks sat unembedded and the loop crawled through enrichment at a third
+# of its rate. Backing off hands that time to the stage that still works, and costs
+# nothing when the provider is healthy (a pass that embeds anything clears the entry).
+#
+# Doubles per consecutive failure, so a long outage is probed proportionally less often.
+_EMBED_BACKOFF_START_SEC = float(os.getenv("PDFSPECS_EMBED_BACKOFF_SEC", "300"))
+_EMBED_BACKOFF_MAX_SEC = float(os.getenv("PDFSPECS_EMBED_BACKOFF_MAX_SEC", "3600"))
+# org_id -> {"until": monotonic deadline, "delay": the backoff that set it}
+_embed_backoff: dict = {}
+
+
+def _embed_backoff_active(org_id: str) -> bool:
+    """True while this org's embedding backfill is in a post-failure cooldown."""
+    entry = _embed_backoff.get(org_id)
+    return bool(entry) and time.monotonic() < entry["until"]
+
+
+def _embed_backoff_note_failure(org_id: str) -> float:
+    """Start or double this org's cooldown. Returns the delay applied, in seconds."""
+    previous = _embed_backoff.get(org_id, {}).get("delay", 0.0)
+    delay = min(_EMBED_BACKOFF_MAX_SEC,
+                previous * 2 if previous else _EMBED_BACKOFF_START_SEC)
+    _embed_backoff[org_id] = {"until": time.monotonic() + delay, "delay": delay}
+    return delay
+
+
+def _embed_backoff_clear(org_id: str) -> None:
+    """Forget this org's cooldown after a pass that embedded something."""
+    _embed_backoff.pop(org_id, None)
+
+
 def _org_provider_settings(org_id: str) -> enricher.ProviderSettings:
     """Build a per-org NVIDIA config from that org's saved settings (BYO key)."""
     return enricher.ProviderSettings(
@@ -400,7 +449,19 @@ _SWEEP_INTERVAL_SEC = float(os.getenv("PDFSPECS_STUCK_SWEEP_SEC", "300"))
 
 def worker_state() -> dict:
     """Snapshot of the worker thread's progress, for /health. Never raises."""
-    return dict(_worker_state)
+    state = dict(_worker_state)
+    # Report a held-off embedding backfill: without this the only symptom of a dead
+    # embeddings endpoint is a pending-vector count that never moves. Counts only — org
+    # ids do not belong in an unauthenticated endpoint.
+    try:
+        now = time.monotonic()
+        waits = [e["until"] - now for e in _embed_backoff.values() if e["until"] > now]
+        if waits:
+            state["embed_backoff"] = {"orgs": len(waits),
+                                      "resumes_in_sec": round(max(waits), 1)}
+    except Exception:
+        pass
+    return state
 
 
 def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: bool = True):
@@ -470,12 +531,39 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                 logger.error("Could not list orgs pending embedding: %s", e)
                 orgs = []
             for org in orgs:
+                if _embed_backoff_active(org):
+                    continue
+                # run_embedding_pass raises on a provider error, which would otherwise
+                # hide the chunks it had already committed — and a pass that embedded 30
+                # before timing out on the 31st is a flaky provider, not a dead one, so
+                # backing off on it would strand the corpus. progress_cb keeps the count.
+                progress = {"n": 0}
                 try:
-                    if run_embedding_pass(org, limit=200):
-                        worked = True
-                        break
+                    embedded = run_embedding_pass(
+                        org, limit=200, progress_cb=lambda n: progress.__setitem__("n", n))
                 except Exception as e:
-                    logger.error("Embedding backfill failed for org %s: %s", org, e)
+                    embedded = progress["n"]
+                    if not embedded:
+                        delay = _embed_backoff_note_failure(org)
+                        logger.error("Embedding backfill failed for org %s with nothing "
+                                     "embedded (%s: %s); holding it off for %.0fs so "
+                                     "enrichment keeps the loop.",
+                                     org, type(e).__name__, e, delay)
+                        continue
+                    logger.warning("Embedding backfill for org %s embedded %d chunk(s) "
+                                   "then failed (%s: %s); treating it as progress.",
+                                   org, embedded, type(e).__name__, e)
+                if embedded:
+                    _embed_backoff_clear(org)
+                    worked = True
+                    break
+                # The org is in this list precisely because it has chunks with no vectors,
+                # so a pass that embedded none of them got nowhere — whether the provider
+                # returned empty vectors or the chunks are genuinely unembeddable. Either
+                # way an immediate retry repeats it, including the API calls it costs.
+                delay = _embed_backoff_note_failure(org)
+                logger.warning("Embedding backfill embedded nothing for org %s; holding "
+                               "it off for %.0fs.", org, delay)
             if worked:
                 continue
 
@@ -495,7 +583,7 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                 worked = False
                 for org in orgs:
                     try:
-                        if run_enrichment_pass(org, limit=25):
+                        if run_enrichment_pass(org, limit=_enrich_slice()):
                             worked = True
                             break
                     except enricher.APIKeyMissingError:
