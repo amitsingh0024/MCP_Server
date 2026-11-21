@@ -77,6 +77,16 @@ services:
       # the books are in.
       - key: PDFSPECS_ENRICH_SLICE
         value: "200"
+      # Cooldown after the provider rate-limits a slice. The floor is what a slice that
+      # did work and then hit the limit waits; the ceiling is only reached by passes that
+      # achieve nothing. Declared here because the defaults were wrong once and the cost
+      # was invisible: at 120/1800 the delay ratcheted to half an hour between bursts and
+      # the worker spent 133 of 178 minutes idle. Lower the floor only with the 429 rate
+      # in view — too low and every resume is a no-progress pass, which escalates.
+      - key: PDFSPECS_ENRICH_BACKOFF_SEC
+        value: "30"
+      - key: PDFSPECS_ENRICH_BACKOFF_MAX_SEC
+        value: "600"
       # Set to the deployed frontend origin (Vercel URL) in M7's frontend step.
       - key: CORS_ORIGINS
         sync: false

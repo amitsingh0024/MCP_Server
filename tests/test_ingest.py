@@ -695,3 +695,105 @@ class TestEnrichmentBackoff(unittest.TestCase):
         pass_mock = self._idle_loop(3, {"side_effect": RuntimeError("boom")})
         self.assertEqual(pass_mock.call_count, 3)
         self.assertFalse(ingest._enrich_backoff.active("org-1"))
+
+
+class TestStandDownDoesNotRatchet(unittest.TestCase):
+    """
+    The cooldown must not grow while the stage is getting work done.
+
+    It did. Because a rate limit raises out of run_enrichment_pass rather than being
+    returned, a slice that summarised 190 of its 200 chunks never reached clear(), so
+    every slice counted as a failure and the delay doubled off the last one: 126s, 245s,
+    584s, 979s, 1809s between bursts that were each completing ~100 chunks. The worker
+    spent 133 of 178 minutes idle waiting out a limit that cleared in under a second.
+    """
+
+    def _backoff(self):
+        return ingest._StageBackoff("test", start_sec=30.0, max_sec=600.0)
+
+    def test_progress_holds_the_delay_at_the_floor(self):
+        b = self._backoff()
+        for _ in range(6):
+            self.assertEqual(b.note_failure("org-1", after_progress=True), 30.0)
+
+    def test_passes_that_get_nowhere_still_escalate(self):
+        b = self._backoff()
+        self.assertEqual([b.note_failure("org-1") for _ in range(5)],
+                         [30.0, 60.0, 120.0, 240.0, 480.0])
+
+    def test_escalation_is_capped(self):
+        b = self._backoff()
+        for _ in range(12):
+            delay = b.note_failure("org-1")
+        self.assertEqual(delay, 600.0)
+
+    def test_progress_resets_the_escalation(self):
+        """
+        The ratchet proper: after a long standdown, one productive slice must put the
+        next failure back at the floor rather than continuing to double.
+        """
+        b = self._backoff()
+        b.note_failure("org-1")
+        b.note_failure("org-1")
+        self.assertEqual(b.note_failure("org-1"), 120.0)
+        b.note_failure("org-1", after_progress=True)
+        self.assertEqual(b.note_failure("org-1"), 30.0)
+
+    def test_each_org_escalates_on_its_own(self):
+        b = self._backoff()
+        b.note_failure("org-1")
+        b.note_failure("org-1")
+        self.assertEqual(b.note_failure("org-2"), 30.0)
+
+    def test_report_marks_an_escalating_stage_and_only_that(self):
+        """
+        /health has to say which of the two situations it is. Reported identically, a
+        ratchet to the ceiling read as intended behaviour for three hours.
+        """
+        b = self._backoff()
+        b.note_failure("org-1", after_progress=True)
+        self.assertNotIn("escalated_to_sec", b.report())
+
+        b.note_failure("org-1")
+        b.note_failure("org-1")
+        self.assertEqual(b.report()["escalated_to_sec"], 60.0)
+
+    def test_report_is_none_when_nothing_is_held_off(self):
+        self.assertIsNone(self._backoff().report())
+
+
+class TestRateLimitAfterWorkIsPacedNotPunished(unittest.TestCase):
+    """The loop end of the same fix: the call site has to pass the progress through."""
+
+    def setUp(self):
+        ingest._enrich_backoff._entries.clear()
+
+    tearDown = setUp
+
+    def _run_one_slice(self, enriched_before_the_limit):
+        def slice_(org_id, limit=None, progress_cb=None):
+            if enriched_before_the_limit:
+                progress_cb(enriched_before_the_limit)
+            raise enricher.RateLimitedError("429")
+
+        tasks = [None, _Stop()]
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=tasks), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding",
+                               return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment",
+                               return_value=["org-1"]), \
+             mock.patch.object(ingest, "run_enrichment_pass", side_effect=slice_), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        return ingest._enrich_backoff._entries["org-1"]
+
+    def test_a_slice_that_worked_takes_the_floor(self):
+        # delay 0.0 is the marker of the non-escalating path: the next failure with no
+        # progress starts from start_sec instead of doubling off this one.
+        self.assertEqual(self._run_one_slice(150)["delay"], 0.0)
+
+    def test_a_slice_that_did_nothing_escalates(self):
+        self.assertEqual(self._run_one_slice(0)["delay"],
+                         ingest._enrich_backoff.start_sec)
