@@ -128,6 +128,25 @@ def cmd_enrich(args) -> int:
     return 0
 
 
+def cmd_requeue_failed(args) -> int:
+    """Clear enriched_at on chunks that were marked done without a summary."""
+    org = _org()
+    failed = pgdb.count_failed_enrichment(org)
+    if not failed:
+        print("No chunks are marked enriched without a summary.")
+        return 0
+    if not args.yes:
+        print(f"{failed} chunk(s) are marked enriched with no summary. They keep their "
+              f"text and vectors but have no summary or entities, and the enrichment "
+              f"pass will never offer them again.")
+        print("Re-run with --yes to requeue them.")
+        return 0
+    n = pgdb.reset_failed_enrichment(org)
+    pending, total = pgdb.count_pending_enrichment(org)
+    print(f"Requeued {n} chunk(s). {pending} of {total} now pending enrichment.")
+    return 0
+
+
 def cmd_embed(args) -> int:
     """Stage 1.5: backfill vectors for chunks stored text-only after a provider failure."""
     org = _org()
@@ -266,6 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--limit", type=int, default=None,
                     help="enrich at most this many chunks, then stop")
     sp.set_defaults(func=cmd_enrich)
+
+    sp = sub.add_parser("requeue-failed",
+                        help="requeue chunks marked enriched but left without a summary")
+    sp.add_argument("--yes", action="store_true",
+                    help="actually requeue them (otherwise just reports the count)")
+    sp.set_defaults(func=cmd_requeue_failed)
 
     sub.add_parser("ls", help="list ingested documents").set_defaults(func=cmd_ls)
     sub.add_parser("status", help="show the ingestion queue").set_defaults(func=cmd_status)

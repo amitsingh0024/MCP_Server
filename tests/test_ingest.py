@@ -47,7 +47,7 @@ class TestEnrichmentFairness(unittest.TestCase):
         """The regression that mattered: org order decided whether anyone got enriched."""
         seen = []
 
-        def enrich_pass(org, limit=None):
+        def enrich_pass(org, limit=None, progress_cb=None):
             seen.append(org)
             if org == "org-no-key":
                 raise enricher.APIKeyMissingError("no key configured")
@@ -60,7 +60,7 @@ class TestEnrichmentFairness(unittest.TestCase):
         """A provider error for one tenant is not a reason to skip every other tenant."""
         seen = []
 
-        def enrich_pass(org, limit=None):
+        def enrich_pass(org, limit=None, progress_cb=None):
             seen.append(org)
             if org == "org-broken":
                 raise RuntimeError("provider exploded")
@@ -70,7 +70,7 @@ class TestEnrichmentFairness(unittest.TestCase):
         self.assertEqual(seen, ["org-broken", "org-healthy"])
 
     def test_nothing_enrichable_sleeps_instead_of_spinning(self):
-        def enrich_pass(org, limit=None):
+        def enrich_pass(org, limit=None, progress_cb=None):
             raise enricher.APIKeyMissingError("no key configured")
 
         sleep = self._run_loop(["org-a", "org-b"], enrich_pass)
@@ -424,7 +424,8 @@ class TestEmbeddingBackoff(unittest.TestCase):
     """
 
     def setUp(self):
-        ingest._embed_backoff.clear()
+        ingest._embed_backoff._entries.clear()
+        ingest._enrich_backoff._entries.clear()
 
     tearDown = setUp
 
@@ -479,35 +480,47 @@ class TestEmbeddingBackoff(unittest.TestCase):
         enrich.assert_not_called()
 
     def test_the_cooldown_doubles_and_is_capped(self):
-        first = ingest._embed_backoff_note_failure("org-1")
-        self.assertEqual(first, ingest._EMBED_BACKOFF_START_SEC)
-        self.assertEqual(ingest._embed_backoff_note_failure("org-1"), first * 2)
-        self.assertEqual(ingest._embed_backoff_note_failure("org-1"), first * 4)
+        b = ingest._embed_backoff
+        first = b.note_failure("org-1")
+        self.assertEqual(first, b.start_sec)
+        self.assertEqual(b.note_failure("org-1"), first * 2)
+        self.assertEqual(b.note_failure("org-1"), first * 4)
         for _ in range(20):
-            last = ingest._embed_backoff_note_failure("org-1")
-        self.assertEqual(last, ingest._EMBED_BACKOFF_MAX_SEC)
+            last = b.note_failure("org-1")
+        self.assertEqual(last, b.max_sec)
 
     def test_a_successful_pass_clears_the_cooldown(self):
-        ingest._embed_backoff_note_failure("org-1")
-        self.assertTrue(ingest._embed_backoff_active("org-1"))
-        ingest._embed_backoff_clear("org-1")
-        self.assertFalse(ingest._embed_backoff_active("org-1"))
+        b = ingest._embed_backoff
+        b.note_failure("org-1")
+        self.assertTrue(b.active("org-1"))
+        b.clear("org-1")
+        self.assertFalse(b.active("org-1"))
 
     def test_the_cooldown_is_per_org(self):
         """One tenant's broken key or model must not stall another's backfill."""
-        ingest._embed_backoff_note_failure("org-1")
-        self.assertTrue(ingest._embed_backoff_active("org-1"))
-        self.assertFalse(ingest._embed_backoff_active("org-2"))
+        ingest._embed_backoff.note_failure("org-1")
+        self.assertTrue(ingest._embed_backoff.active("org-1"))
+        self.assertFalse(ingest._embed_backoff.active("org-2"))
 
-    def test_health_reports_a_held_off_backfill(self):
+    def test_the_two_stages_back_off_independently(self):
+        """A dead embeddings endpoint must not stand enrichment down, or vice versa."""
+        ingest._embed_backoff.note_failure("org-1")
+        self.assertFalse(ingest._enrich_backoff.active("org-1"))
+        ingest._enrich_backoff.note_failure("org-2")
+        self.assertFalse(ingest._embed_backoff.active("org-2"))
+
+    def test_health_reports_each_held_off_stage(self):
         """
-        Without this the only symptom of a dead embeddings endpoint is a pending-vector
-        count that never moves. Org ids stay out of it: /health is unauthenticated.
+        Without this the only symptom of a dead endpoint or a rate-limited key is a
+        pending count that never moves. Org ids stay out: /health is unauthenticated.
         """
         self.assertNotIn("embed_backoff", ingest.worker_state())
-        ingest._embed_backoff_note_failure("org-1")
+        self.assertNotIn("enrich_backoff", ingest.worker_state())
+        ingest._embed_backoff.note_failure("org-1")
+        ingest._enrich_backoff.note_failure("org-1")
         state = ingest.worker_state()
         self.assertEqual(state["embed_backoff"]["orgs"], 1)
+        self.assertEqual(state["enrich_backoff"]["orgs"], 1)
         self.assertGreater(state["embed_backoff"]["resumes_in_sec"], 0)
         self.assertNotIn("org-1", repr(state))
 
@@ -546,3 +559,139 @@ class TestEnrichmentSliceSize(unittest.TestCase):
             with self.assertRaises(_Stop):
                 ingest.run_worker_loop(interval_sec=0)
         self.assertEqual(enrich.call_args.kwargs["limit"], 200)
+
+
+class TestRateLimitIsNotAChunkFailure(unittest.TestCase):
+    """
+    The expensive bug. `work()` answers a failed batch by retrying its chunks one at a
+    time, which is right for an unparseable response and catastrophic for a 429: one
+    rejected batch became 5 attempts + 8 chunks x 5 attempts = 45 requests, sent while
+    the provider was already refusing, and each of those 8 chunks was then marked
+    enriched with no summary.
+
+    mark_enrichment_failed is permanent — chunks_pending_enrichment selects on
+    `enriched_at IS NULL` — so 602 chunks on this corpus lost their summaries for good
+    to what was a transient rate limit.
+    """
+
+    def setUp(self):
+        ingest._enrich_backoff._entries.clear()
+
+    tearDown = setUp
+
+    def _pass(self, batch_effect, single_effect=None):
+        chunks = [{"id": f"c{i}", "text_content": "text"} for i in range(8)]
+        with mock.patch.object(ingest, "_org_provider_settings") as settings, \
+             mock.patch.object(ingest.pgdb, "chunks_pending_enrichment",
+                               side_effect=[chunks, []]), \
+             mock.patch.object(ingest.pgdb, "record_token_usage"), \
+             mock.patch.object(ingest.pgdb, "save_enrichment") as save, \
+             mock.patch.object(ingest.pgdb, "mark_enrichment_failed") as failed, \
+             mock.patch.object(ingest.enricher, "extract_metadata_batch",
+                               side_effect=batch_effect) as batch, \
+             mock.patch.object(ingest.enricher, "extract_metadata",
+                               side_effect=single_effect) as single:
+            settings.return_value.nvidia_api_key = "k"
+            yield_err = None
+            try:
+                done = ingest.run_enrichment_pass("org-1")
+            except BaseException as e:      # noqa: BLE001 - the test inspects it
+                done, yield_err = 0, e
+        return done, yield_err, batch, single, save, failed
+
+    def test_a_rate_limited_batch_is_not_retried_per_chunk(self):
+        done, err, batch, single, save, failed = self._pass(
+            enricher.RateLimitedError("429 after 5 attempts"))
+        self.assertIsInstance(err, enricher.RateLimitedError)
+        self.assertEqual(batch.call_count, 1)
+        # The amplification: 8 more calls where the happy path needed one.
+        single.assert_not_called()
+
+    def test_a_rate_limited_batch_marks_no_chunk_failed(self):
+        done, err, batch, single, save, failed = self._pass(
+            enricher.RateLimitedError("429 after 5 attempts"))
+        failed.assert_not_called()
+        save.assert_not_called()
+
+    def test_a_rate_limit_during_the_per_chunk_fallback_still_marks_nothing(self):
+        """
+        The batch failed for an unrelated reason, so the fallback is correct to run —
+        but the moment it meets a 429 it must stop, not record the remaining chunks as
+        permanently summary-less.
+        """
+        done, err, batch, single, save, failed = self._pass(
+            ValueError("unparseable JSON"),
+            single_effect=enricher.RateLimitedError("429"))
+        self.assertIsInstance(err, enricher.RateLimitedError)
+        self.assertEqual(single.call_count, 1)
+        failed.assert_not_called()
+
+    def test_an_unparseable_response_still_falls_back_per_chunk(self):
+        """The behaviour the fallback exists for must survive this change."""
+        done, err, batch, single, save, failed = self._pass(
+            ValueError("dropped ids"),
+            single_effect=[{"summary": f"s{i}", "entities": []} for i in range(8)])
+        self.assertIsNone(err)
+        self.assertEqual(single.call_count, 8)
+        self.assertEqual(save.call_count, 8)
+        failed.assert_not_called()
+
+    def test_a_chunk_the_model_cannot_handle_is_still_marked_done(self):
+        """
+        Otherwise one bad chunk wedges the pass for ever: it is returned oldest-first,
+        so it would be re-fetched on every iteration.
+        """
+        done, err, batch, single, save, failed = self._pass(
+            ValueError("dropped ids"), single_effect=ValueError("bad chunk"))
+        self.assertIsNone(err)
+        self.assertEqual(failed.call_count, 8)
+
+
+class TestEnrichmentBackoff(unittest.TestCase):
+    def setUp(self):
+        ingest._enrich_backoff._entries.clear()
+
+    tearDown = setUp
+
+    def _idle_loop(self, iterations, enrich):
+        tasks = [None] * iterations + [_Stop()]
+        with mock.patch.object(ingest.pgdb, "reset_stuck_tasks", return_value=0), \
+             mock.patch.object(ingest.pgdb, "get_next_task", side_effect=tasks), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_embedding",
+                               return_value=[]), \
+             mock.patch.object(ingest.pgdb, "orgs_with_pending_enrichment",
+                               return_value=["org-1"]), \
+             mock.patch.object(ingest, "run_enrichment_pass", **enrich) as pass_mock, \
+             mock.patch("time.sleep"):
+            with self.assertRaises(_Stop):
+                ingest.run_worker_loop(interval_sec=0)
+        return pass_mock
+
+    def test_a_rate_limit_stands_the_org_down(self):
+        """
+        Retrying straight into a rate limit is what caused it. The loop must wait
+        instead — the opposite of what it did before.
+        """
+        pass_mock = self._idle_loop(
+            4, {"side_effect": enricher.RateLimitedError("429")})
+        self.assertEqual(pass_mock.call_count, 1)
+        self.assertTrue(ingest._enrich_backoff.active("org-1"))
+
+    def test_chunks_enriched_before_the_rate_limit_still_count(self):
+        """A slice that summarised 150 chunks then hit the limit did 150 chunks of work."""
+        def partial(org_id, limit=None, progress_cb=None):
+            progress_cb(150)
+            raise enricher.RateLimitedError("429")
+
+        self._idle_loop(1, {"side_effect": partial})
+        self.assertTrue(ingest._enrich_backoff.active("org-1"))
+
+    def test_a_working_pass_clears_the_standdown(self):
+        self._idle_loop(2, {"return_value": 25})
+        self.assertFalse(ingest._enrich_backoff.active("org-1"))
+
+    def test_a_plain_provider_error_is_not_a_standdown(self):
+        """Only a rate limit means 'stop asking'. Other errors keep the old behaviour."""
+        pass_mock = self._idle_loop(3, {"side_effect": RuntimeError("boom")})
+        self.assertEqual(pass_mock.call_count, 3)
+        self.assertFalse(ingest._enrich_backoff.active("org-1"))

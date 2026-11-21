@@ -441,6 +441,43 @@ def count_pending_enrichment(org_id: str) -> tuple:
         return int(row["pending"]), int(row["total"])
 
 
+def count_failed_enrichment(org_id: str) -> int:
+    """How many chunks are marked enriched but carry no summary."""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM chunks "
+            "WHERE org_id = %s AND enriched_at IS NOT NULL AND summary IS NULL",
+            (org_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+
+def reset_failed_enrichment(org_id: str) -> int:
+    """
+    Requeue chunks that mark_enrichment_failed gave up on. Returns how many.
+
+    That function is permanent by design — it sets `enriched_at` so a chunk whose text
+    the LLM genuinely cannot handle stops wedging the pass. But it was also reached by
+    chunks whose only problem was a provider rate limit, and
+    chunks_pending_enrichment() selects on `enriched_at IS NULL`, so those were never
+    offered again: 602 chunks on this corpus kept their text and vectors but silently
+    lost their summaries and entities for good.
+
+    `summary IS NULL` is what distinguishes them. save_enrichment() always writes a
+    string (`summary or ""`), so a NULL summary beside a non-NULL enriched_at can only
+    have come from mark_enrichment_failed.
+
+    Re-running this is harmless: a chunk that fails again is simply marked again.
+    """
+    with connection() as conn:
+        result = conn.execute(
+            "UPDATE chunks SET enriched_at = NULL "
+            "WHERE org_id = %s AND enriched_at IS NOT NULL AND summary IS NULL",
+            (org_id,),
+        )
+        return result.rowcount
+
+
 def save_enrichment(org_id: str, chunk_id: str, summary: str, entities: list):
     """
     Attach a summary and entities to an already-stored chunk and mark it enriched.

@@ -74,3 +74,47 @@ class TestUuidGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResetFailedEnrichment(unittest.TestCase):
+    """
+    The predicate is the whole safety of this function. It clears `enriched_at`, so one
+    too-wide WHERE would requeue chunks that already have good summaries and spend the
+    corpus again; one too-narrow one would leave the 602 chunks lost for ever.
+
+    `summary IS NULL` is the discriminator: save_enrichment() always writes a string
+    (`summary or ""`), so a NULL summary beside a non-NULL enriched_at can only have
+    come from mark_enrichment_failed.
+    """
+
+    def _sql(self, fn, rowcount=7):
+        conn = mock.MagicMock()
+        conn.execute.return_value.rowcount = rowcount
+        conn.execute.return_value.fetchone.return_value = {"n": rowcount}
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value = conn
+        with mock.patch.object(pgdb, "connection", return_value=ctx):
+            result = fn("org-1")
+        sql, params = conn.execute.call_args[0]
+        return " ".join(sql.split()), params, result
+
+    def test_it_only_touches_chunks_marked_done_without_a_summary(self):
+        sql, params, n = self._sql(pgdb.reset_failed_enrichment)
+        self.assertIn("SET enriched_at = NULL", sql)
+        self.assertIn("enriched_at IS NOT NULL", sql)
+        self.assertIn("summary IS NULL", sql)
+        self.assertEqual(n, 7)
+
+    def test_it_is_scoped_to_one_org(self):
+        """Every table here is multi-tenant; a missing org_id would reach other tenants."""
+        sql, params, _ = self._sql(pgdb.reset_failed_enrichment)
+        self.assertIn("org_id = %s", sql)
+        self.assertEqual(params, ("org-1",))
+
+    def test_the_count_uses_the_same_predicate_as_the_reset(self):
+        """Otherwise the CLI reports a number it is not about to act on."""
+        reset_sql, _, _ = self._sql(pgdb.reset_failed_enrichment)
+        count_sql, _, _ = self._sql(pgdb.count_failed_enrichment)
+        for clause in ("enriched_at IS NOT NULL", "summary IS NULL", "org_id = %s"):
+            self.assertIn(clause, reset_sql)
+            self.assertIn(clause, count_sql)
