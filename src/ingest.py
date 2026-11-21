@@ -105,8 +105,37 @@ class _StageBackoff:
         entry = self._entries.get(org_id)
         return bool(entry) and time.monotonic() < entry["until"]
 
-    def note_failure(self, org_id: str) -> float:
-        """Start or double this org's cooldown. Returns the delay applied, in seconds."""
+    def note_failure(self, org_id: str, *, after_progress: bool = False) -> float:
+        """
+        Start or extend this org's cooldown. Returns the delay applied, in seconds.
+
+        Escalation is for a stage that cannot get anywhere. `after_progress=True` says
+        the pass did real work and only then met the provider — a rate limit reached
+        partway through a slice. That earns the floor delay and resets the escalation,
+        because the stage is working and the limit is being paced, not waited out.
+
+        Without that distinction this was a one-way ratchet. A slice of 200 chunks
+        enriched 58-190 of them and then took a 429, which raises rather than returns,
+        so the pass never reached clear() and every slice counted as a failure:
+
+            06:31:34  stood down  126s      <- the one slice that returned cleanly
+            06:35:45  stood down  245s
+            06:42:14  stood down  584s
+            06:55:27  stood down  979s
+            07:14:00  stood down 1809s      <- the ceiling, and it stayed there
+
+        That is 120 -> 240 -> 480 -> 960 -> 1800 while the stage was summarising ~100
+        chunks per burst throughout. Measured over those three hours: 45 minutes of work
+        to 133 minutes of standing down, with a single probe on the same key answering
+        HTTP 200 in 0.55s three minutes into a standdown. The limit is short-lived; only
+        the penalty for it was long.
+        """
+        if after_progress:
+            # Floor, and forget the escalation: `delay` 0.0 makes the next failure with
+            # no progress start from start_sec rather than doubling off this one.
+            self._entries[org_id] = {"until": time.monotonic() + self.start_sec,
+                                     "delay": 0.0}
+            return self.start_sec
         previous = self._entries.get(org_id, {}).get("delay", 0.0)
         delay = min(self.max_sec, previous * 2 if previous else self.start_sec)
         self._entries[org_id] = {"until": time.monotonic() + delay, "delay": delay}
@@ -120,29 +149,42 @@ class _StageBackoff:
         """
         {orgs, resumes_in_sec} for /health, or None when nothing is held off.
 
+        `escalated_to_sec` appears only while the delay is doubling, i.e. consecutive
+        passes that got nowhere. A cooldown imposed after a pass that did work carries
+        no such key, and the difference matters to whoever is reading: the first means
+        the stage cannot proceed, the second means it is pacing itself and progress is
+        still being made. Reported as one or the other, a ratchet to the ceiling read
+        as intended behaviour for three hours.
+
         Counts only. Org ids do not belong in an unauthenticated endpoint, and the point
         of the field is that a held-off stage is otherwise invisible: the only symptom is
         a pending count that never moves.
         """
         now = time.monotonic()
-        waits = [e["until"] - now
-                 for e in list(self._entries.values()) if e["until"] > now]
-        if not waits:
+        held = [e for e in list(self._entries.values()) if e["until"] > now]
+        if not held:
             return None
-        return {"orgs": len(waits), "resumes_in_sec": round(max(waits), 1)}
+        longest = max(held, key=lambda e: e["until"])
+        out = {"orgs": len(held), "resumes_in_sec": round(longest["until"] - now, 1)}
+        if longest.get("delay"):
+            out["escalated_to_sec"] = round(longest["delay"], 1)
+        return out
 
 
-# A dead endpoint stays dead for a while, so start long. A rate limit usually clears
-# within a minute or two, so start short — but cap it well below the embedding one,
-# since enrichment has nothing else to fall back to.
+# A dead endpoint stays dead for a while, so start long. A rate limit clears fast, so
+# start short: measured, NVIDIA accepted a request 0.55s into what had been a standdown,
+# and the productive bursts between standdowns ran 1-5 minutes. 30s is the pause after a
+# slice that worked and then hit the limit, so the duty cycle stays high; the ceiling is
+# only ever reached by consecutive passes that achieve nothing, and 600s there probes a
+# genuine outage 6 times an hour instead of twice.
 _embed_backoff = _StageBackoff(
     "embed",
     float(os.getenv("PDFSPECS_EMBED_BACKOFF_SEC", "300")),
     float(os.getenv("PDFSPECS_EMBED_BACKOFF_MAX_SEC", "3600")))
 _enrich_backoff = _StageBackoff(
     "enrich",
-    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_SEC", "120")),
-    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_MAX_SEC", "1800")))
+    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_SEC", "30")),
+    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_MAX_SEC", "600")))
 
 
 def _org_provider_settings(org_id: str) -> enricher.ProviderSettings:
@@ -644,13 +686,20 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                     except enricher.APIKeyMissingError:
                         continue               # this org has no key; others may
                     except enricher.RateLimitedError as e:
-                        delay = _enrich_backoff.note_failure(org)
+                        # A limit reached partway through a slice is the normal shape of
+                        # this: the slice was summarising chunks until it hit. Escalating
+                        # on that turned a short limit into 30-minute outages (see
+                        # _StageBackoff.note_failure), so progress holds the delay at the
+                        # floor; only a slice that got nowhere doubles it.
+                        made_progress = bool(progress["n"])
+                        delay = _enrich_backoff.note_failure(
+                            org, after_progress=made_progress)
                         logger.warning(
                             "Provider is rate limiting org %s; %d chunk(s) enriched "
                             "before it hit. Standing enrichment down for %.0fs rather "
                             "than retrying into it (%s).",
                             org, progress["n"], delay, e)
-                        worked = bool(progress["n"])
+                        worked = made_progress
                         if worked:
                             break
                     except Exception as e:
