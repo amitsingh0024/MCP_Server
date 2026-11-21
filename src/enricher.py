@@ -17,6 +17,8 @@ import logging
 import time
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import requests
 from requests.exceptions import RequestException, HTTPError
 
@@ -37,6 +39,22 @@ logger = logging.getLogger("pdfspecs.enricher")
 
 class APIKeyMissingError(ValueError):
     pass
+
+
+class RateLimitedError(RuntimeError):
+    """
+    The provider is rejecting requests for rate (HTTP 429) and retrying did not clear it.
+
+    Worth its own type because a rate limit is the one transient failure whose usual
+    remedy — retry, then fall back to smaller requests — makes it worse. A rejected
+    batch of 8 chunks cost 5 attempts, then 8 individual chunks at 5 attempts each: 45
+    requests where the happy path needs 1, sent precisely while the provider is already
+    refusing. That amplification took a 5,507 chunk/hour run down to 618 and left 602
+    chunks marked enriched with no summary, because the per-chunk fallback treats a
+    rate limit as that chunk's own permanent failure.
+
+    Callers must let this one out so the caller that owns the schedule can stand down.
+    """
 
 
 class ModelRetiredError(RuntimeError):
@@ -169,6 +187,44 @@ def _record_usage(usage_sink, purpose, prompt_tokens, completion_tokens):
         logger.error(f"Failed to record token usage: {e}")
 
 
+# Longest a single attempt will honour from a Retry-After header. Past this the
+# org-level backoff in ingest.py should sit the outage out instead of pinning a thread.
+_RETRY_AFTER_CAP_SEC = float(os.getenv("PDFSPECS_RETRY_AFTER_CAP_SEC", "60"))
+
+
+def _status_of(exc) -> int | None:
+    """HTTP status behind a RequestException, or None if it never got a response."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) if response is not None else None
+
+
+def _retry_after_seconds(exc) -> float | None:
+    """
+    Seconds the provider asked us to wait, from a Retry-After header. None if absent.
+
+    The header is either a delay in seconds or an HTTP date; both are in the spec and
+    providers use both.
+    """
+    response = getattr(exc, "response", None)
+    raw = (getattr(response, "headers", None) or {}).get("Retry-After") if response else None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1.5):
     """Executes a POST request with global throttling + exponential backoff for transient errors."""
     for attempt in range(max_retries):
@@ -202,6 +258,10 @@ def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1
                     f"Provider response: {e}") from e
 
             if attempt == max_retries - 1:
+                if _status_of(e) == 429:
+                    raise RateLimitedError(
+                        f"Provider is rate limiting this key and {max_retries} attempts "
+                        f"did not clear it: {e}") from e
                 raise e
 
             # Don't retry on client errors (except 429 Too Many Requests).
@@ -214,6 +274,13 @@ def _post_with_retry(url, json_payload, headers, max_retries=5, backoff_factor=1
                     raise e
 
             sleep_time = backoff_factor * (2 ** attempt)
+            # A 429 usually says how long to wait. Sleeping less than the provider asked
+            # for is a large part of what turns a rate limit into a storm, so take the
+            # longer of the two — capped, because the org-level backoff in ingest.py is
+            # the right place to sit out a long one, not a blocked worker thread.
+            asked = _retry_after_seconds(e)
+            if asked is not None:
+                sleep_time = max(sleep_time, min(asked, _RETRY_AFTER_CAP_SEC))
             logger.warning(f"API request failed: {e}. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
             time.sleep(sleep_time)
 

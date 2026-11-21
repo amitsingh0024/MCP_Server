@@ -71,42 +71,78 @@ def _enrich_slice() -> int:
     return max(1, int(os.getenv("PDFSPECS_ENRICH_SLICE", "25")))
 
 
-# How long to leave an org's embedding backfill alone after a pass gets nowhere.
-#
-# A dead provider endpoint is not a fast failure: _post_with_retry spends 5 attempts at a
-# 45s timeout, so ~250s of each loop pass went into a call that could not succeed — taken
-# straight out of the enrichment slice that could. Measured against
-# nemotron-3.5-embed-1b answering `504 service request timed out after 120s` to every
-# single-input request while every other model on the same key answered in under a
-# second: 8,001 chunks sat unembedded and the loop crawled through enrichment at a third
-# of its rate. Backing off hands that time to the stage that still works, and costs
-# nothing when the provider is healthy (a pass that embeds anything clears the entry).
-#
-# Doubles per consecutive failure, so a long outage is probed proportionally less often.
-_EMBED_BACKOFF_START_SEC = float(os.getenv("PDFSPECS_EMBED_BACKOFF_SEC", "300"))
-_EMBED_BACKOFF_MAX_SEC = float(os.getenv("PDFSPECS_EMBED_BACKOFF_MAX_SEC", "3600"))
-# org_id -> {"until": monotonic deadline, "delay": the backoff that set it}
-_embed_backoff: dict = {}
+class _StageBackoff:
+    """
+    Per-org cooldown for an idle-loop stage whose provider is failing.
+
+    Both idle stages call a provider that can fail for minutes or hours at a stretch,
+    and both failed expensively before this existed:
+
+    * The embedding backfill does not fail fast. `_post_with_retry` spends 5 attempts at
+      a 45s timeout, so ~250s of every loop pass went into a call that could not succeed
+      — and the backfill runs FIRST, so that time came out of enrichment. Measured
+      against nemotron-3.5-embed-1b answering `504 service request timed out after 120s`
+      to every single-input request while every other model on the same key answered in
+      under a second.
+    * Enrichment answered a rate limit by multiplying its own request volume. See
+      enricher.RateLimitedError: 45 requests to enrich 8 chunks, sent while the provider
+      was already refusing.
+
+    Holding the org off hands the time to whatever still works and, for a rate limit,
+    stops the requests that caused it. Doubling per consecutive failure probes a long
+    outage proportionally less often. Per org, so one tenant's dead model or exhausted
+    quota cannot stall another's.
+    """
+
+    def __init__(self, name: str, start_sec: float, max_sec: float):
+        self.name = name
+        self.start_sec = start_sec
+        self.max_sec = max_sec
+        self._entries: dict = {}
+
+    def active(self, org_id: str) -> bool:
+        """True while this org is in a post-failure cooldown for this stage."""
+        entry = self._entries.get(org_id)
+        return bool(entry) and time.monotonic() < entry["until"]
+
+    def note_failure(self, org_id: str) -> float:
+        """Start or double this org's cooldown. Returns the delay applied, in seconds."""
+        previous = self._entries.get(org_id, {}).get("delay", 0.0)
+        delay = min(self.max_sec, previous * 2 if previous else self.start_sec)
+        self._entries[org_id] = {"until": time.monotonic() + delay, "delay": delay}
+        return delay
+
+    def clear(self, org_id: str) -> None:
+        """Forget this org's cooldown after a pass that got somewhere."""
+        self._entries.pop(org_id, None)
+
+    def report(self) -> dict | None:
+        """
+        {orgs, resumes_in_sec} for /health, or None when nothing is held off.
+
+        Counts only. Org ids do not belong in an unauthenticated endpoint, and the point
+        of the field is that a held-off stage is otherwise invisible: the only symptom is
+        a pending count that never moves.
+        """
+        now = time.monotonic()
+        waits = [e["until"] - now
+                 for e in list(self._entries.values()) if e["until"] > now]
+        if not waits:
+            return None
+        return {"orgs": len(waits), "resumes_in_sec": round(max(waits), 1)}
 
 
-def _embed_backoff_active(org_id: str) -> bool:
-    """True while this org's embedding backfill is in a post-failure cooldown."""
-    entry = _embed_backoff.get(org_id)
-    return bool(entry) and time.monotonic() < entry["until"]
-
-
-def _embed_backoff_note_failure(org_id: str) -> float:
-    """Start or double this org's cooldown. Returns the delay applied, in seconds."""
-    previous = _embed_backoff.get(org_id, {}).get("delay", 0.0)
-    delay = min(_EMBED_BACKOFF_MAX_SEC,
-                previous * 2 if previous else _EMBED_BACKOFF_START_SEC)
-    _embed_backoff[org_id] = {"until": time.monotonic() + delay, "delay": delay}
-    return delay
-
-
-def _embed_backoff_clear(org_id: str) -> None:
-    """Forget this org's cooldown after a pass that embedded something."""
-    _embed_backoff.pop(org_id, None)
+# A dead endpoint stays dead for a while, so start long. A rate limit usually clears
+# within a minute or two, so start short — but cap it well below the embedding one,
+# since enrichment has nothing else to fall back to.
+_embed_backoff = _StageBackoff(
+    "embed",
+    float(os.getenv("PDFSPECS_EMBED_BACKOFF_SEC", "300")),
+    float(os.getenv("PDFSPECS_EMBED_BACKOFF_MAX_SEC", "3600")))
+_enrich_backoff = _StageBackoff(
+    "enrich",
+    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_SEC", "120")),
+    float(os.getenv("PDFSPECS_ENRICH_BACKOFF_MAX_SEC", "1800")))
 
 
 def _org_provider_settings(org_id: str) -> enricher.ProviderSettings:
@@ -395,6 +431,13 @@ def run_enrichment_pass(org_id: str, limit: int = None, progress_cb=None) -> int
                 return True
             except enricher.APIKeyMissingError:
                 raise
+            except enricher.RateLimitedError:
+                # The ONE failure the per-chunk fallback must not take. It would turn one
+                # rejected batch into 8 more calls at 5 attempts each — 45 requests where
+                # the happy path needs 1 — sent while the provider is already refusing,
+                # and then mark each of those 8 chunks permanently done with no summary.
+                # Let it out; the worker loop stands the whole org down instead.
+                raise
             except Exception as e:
                 # A batch that can't be reconciled (dropped/reordered ids, unparseable JSON)
                 # must not lose the whole group — retry its chunks individually so one bad
@@ -407,7 +450,12 @@ def run_enrichment_pass(org_id: str, limit: int = None, progress_cb=None) -> int
                             chunk["text_content"], settings, usage_sink=usage_sink)
                         pgdb.save_enrichment(org_id, chunk["id"],
                                              meta["summary"], meta["entities"])
-                    except enricher.APIKeyMissingError:
+                    except (enricher.APIKeyMissingError, enricher.RateLimitedError):
+                        # Neither is this chunk's fault, and mark_enrichment_failed is
+                        # permanent — chunks_pending_enrichment selects on
+                        # `enriched_at IS NULL`, so a chunk marked here is never offered
+                        # again. A transient rate limit must not be recorded as a final
+                        # outcome; that is how 602 chunks lost their summaries.
                         raise
                     except Exception as e2:
                         logger.warning("Enrichment failed for chunk %s (%s: %s); marking "
@@ -450,17 +498,15 @@ _SWEEP_INTERVAL_SEC = float(os.getenv("PDFSPECS_STUCK_SWEEP_SEC", "300"))
 def worker_state() -> dict:
     """Snapshot of the worker thread's progress, for /health. Never raises."""
     state = dict(_worker_state)
-    # Report a held-off embedding backfill: without this the only symptom of a dead
-    # embeddings endpoint is a pending-vector count that never moves. Counts only — org
-    # ids do not belong in an unauthenticated endpoint.
-    try:
-        now = time.monotonic()
-        waits = [e["until"] - now for e in _embed_backoff.values() if e["until"] > now]
-        if waits:
-            state["embed_backoff"] = {"orgs": len(waits),
-                                      "resumes_in_sec": round(max(waits), 1)}
-    except Exception:
-        pass
+    # Report a held-off stage. Without this the only symptom of a dead embeddings
+    # endpoint or a rate-limited key is a pending count that never moves.
+    for backoff in (_embed_backoff, _enrich_backoff):
+        try:
+            report = backoff.report()
+        except Exception:
+            continue
+        if report:
+            state[f"{backoff.name}_backoff"] = report
     return state
 
 
@@ -531,7 +577,7 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                 logger.error("Could not list orgs pending embedding: %s", e)
                 orgs = []
             for org in orgs:
-                if _embed_backoff_active(org):
+                if _embed_backoff.active(org):
                     continue
                 # run_embedding_pass raises on a provider error, which would otherwise
                 # hide the chunks it had already committed — and a pass that embedded 30
@@ -544,7 +590,7 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                 except Exception as e:
                     embedded = progress["n"]
                     if not embedded:
-                        delay = _embed_backoff_note_failure(org)
+                        delay = _embed_backoff.note_failure(org)
                         logger.error("Embedding backfill failed for org %s with nothing "
                                      "embedded (%s: %s); holding it off for %.0fs so "
                                      "enrichment keeps the loop.",
@@ -554,14 +600,14 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
                                    "then failed (%s: %s); treating it as progress.",
                                    org, embedded, type(e).__name__, e)
                 if embedded:
-                    _embed_backoff_clear(org)
+                    _embed_backoff.clear(org)
                     worked = True
                     break
                 # The org is in this list precisely because it has chunks with no vectors,
                 # so a pass that embedded none of them got nowhere — whether the provider
                 # returned empty vectors or the chunks are genuinely unembeddable. Either
                 # way an immediate retry repeats it, including the API calls it costs.
-                delay = _embed_backoff_note_failure(org)
+                delay = _embed_backoff.note_failure(org)
                 logger.warning("Embedding backfill embedded nothing for org %s; holding "
                                "it off for %.0fs.", org, delay)
             if worked:
@@ -582,12 +628,31 @@ def run_worker_loop(interval_sec: float = 2.0, max_runs: int = None, enrich: boo
 
                 worked = False
                 for org in orgs:
+                    if _enrich_backoff.active(org):
+                        continue
+                    # A rate limit can arrive partway through a slice, which would hide
+                    # the chunks already summarised. They are committed per chunk, so
+                    # count them.
+                    progress = {"n": 0}
                     try:
-                        if run_enrichment_pass(org, limit=_enrich_slice()):
+                        if run_enrichment_pass(
+                                org, limit=_enrich_slice(),
+                                progress_cb=lambda n: progress.__setitem__("n", n)):
+                            _enrich_backoff.clear(org)
                             worked = True
                             break
                     except enricher.APIKeyMissingError:
                         continue               # this org has no key; others may
+                    except enricher.RateLimitedError as e:
+                        delay = _enrich_backoff.note_failure(org)
+                        logger.warning(
+                            "Provider is rate limiting org %s; %d chunk(s) enriched "
+                            "before it hit. Standing enrichment down for %.0fs rather "
+                            "than retrying into it (%s).",
+                            org, progress["n"], delay, e)
+                        worked = bool(progress["n"])
+                        if worked:
+                            break
                     except Exception as e:
                         logger.error("Enrichment pass failed for org %s: %s", org, e)
                 if not worked:

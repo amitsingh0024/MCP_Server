@@ -59,13 +59,17 @@ services:
       - key: PDFSPECS_NVIDIA_EMBED_BATCH
         value: "1"
       # --- Stage 2 enrichment throughput ---
-      # Parallel enrichment calls. At 1 (the old default) a 25-chunk slice was 4 LLM
-      # calls back to back, ~26s each, and 26,000 chunks came to roughly 37 hours.
-      # The ceiling is the global throttle in enricher.py, which spaces request STARTS
-      # 1.5s apart across all threads = 40/min; 8 calls of ~26s each start about 18
-      # times a minute, so this stays well inside it and the provider sees no burst.
+      # Parallel enrichment calls. 1 was slow (552 chunks/hour) but never lost a chunk.
+      # 8 hit 5,507/hour for one hour and then collapsed: the provider began answering
+      # 429, and the retry path amplified that into a storm (see
+      # enricher.RateLimitedError), which cost 602 chunks their summaries. The local
+      # throttle was never the binding limit — it spaces request STARTS 1.5s apart
+      # (40/min) and 8 threads only reached ~13/min. The provider's own per-key limit
+      # is what we exceeded, and it publishes no number, so this is set empirically:
+      # 2 is a measured ~3x over serial with headroom under the limit that broke 8.
+      # Raise it only with the 429 rate in view, not the throttle arithmetic.
       - key: PDFSPECS_ENRICH_CONCURRENCY
-        value: "8"
+        value: "2"
       # Chunks per idle-loop enrichment slice. 25 existed so a freshly uploaded document
       # waited one slice rather than a whole corpus; with the queue drained it is pure
       # per-slice overhead (two org-scan queries and a pool teardown). At 200 a new

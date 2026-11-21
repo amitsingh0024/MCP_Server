@@ -448,3 +448,85 @@ class TestNoEagerTorchImport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _http_error(status, headers=None):
+    """An HTTPError carrying a response, as requests raises from raise_for_status()."""
+    response = mock.Mock()
+    response.status_code = status
+    response.headers = headers or {}
+    response.text = f'{{"status":{status},"title":"err"}}'
+    return HTTPError(f"{status} Client Error", response=response)
+
+
+class TestRateLimitHandling(unittest.TestCase):
+    """
+    A 429 is transient, so retrying it is right — but the caller has to be able to tell
+    it apart from everything else, because the usual remedy for a failed batch (retry
+    its chunks one at a time) multiplies the request volume by 45 at exactly the moment
+    the provider is refusing. That turned a 5,507 chunk/hour run into 618 and cost 602
+    chunks their summaries.
+    """
+
+    def _post(self, status, headers=None, attempts=5):
+        """Run _post_with_retry against a provider that always answers `status`."""
+        resp = mock.Mock()
+        resp.raise_for_status.side_effect = _http_error(status, headers)
+        slept = []
+        with mock.patch.object(enricher.requests, "post", return_value=resp), \
+             mock.patch.object(enricher, "_throttle"), \
+             mock.patch.object(enricher.time, "sleep", side_effect=slept.append):
+            try:
+                enricher._post_with_retry("https://x/v1/chat/completions", {}, {},
+                                          max_retries=attempts)
+                return None, slept
+            except Exception as e:
+                return e, slept
+
+    def test_an_exhausted_429_raises_its_own_type(self):
+        err, _ = self._post(429)
+        self.assertIsInstance(err, enricher.RateLimitedError)
+
+    def test_a_429_is_still_retried(self):
+        """It is transient; giving up on the first one would be worse."""
+        _, slept = self._post(429, attempts=4)
+        self.assertEqual(len(slept), 3)        # 4 attempts, 3 waits between them
+
+    def test_other_client_errors_keep_their_own_type(self):
+        """A 400 is not a rate limit and must not be mistaken for one."""
+        err, slept = self._post(400)
+        self.assertIsInstance(err, HTTPError)
+        self.assertNotIsInstance(err, enricher.RateLimitedError)
+        self.assertEqual(slept, [])            # client errors are not retried
+
+    def test_a_retry_after_header_is_honoured(self):
+        """
+        Sleeping less than the provider asked for is a large part of what turns a rate
+        limit into a storm. The default backoff here would be 1.5s.
+        """
+        _, slept = self._post(429, {"Retry-After": "30"}, attempts=2)
+        self.assertEqual(slept, [30.0])
+
+    def test_a_retry_after_shorter_than_the_backoff_does_not_shorten_it(self):
+        _, slept = self._post(429, {"Retry-After": "0"}, attempts=2)
+        self.assertEqual(slept, [1.5])
+
+    def test_a_retry_after_is_capped(self):
+        """
+        An hour-long Retry-After must not pin the worker thread. Sitting out a long
+        outage is the org-level backoff's job, not a blocked sleep's.
+        """
+        _, slept = self._post(429, {"Retry-After": "3600"}, attempts=2)
+        self.assertEqual(slept, [enricher._RETRY_AFTER_CAP_SEC])
+
+    def test_a_retry_after_http_date_is_understood(self):
+        """The spec allows a date, and providers send both forms."""
+        from datetime import datetime, timedelta, timezone
+        when = datetime.now(timezone.utc) + timedelta(seconds=25)
+        header = when.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        _, slept = self._post(429, {"Retry-After": header}, attempts=2)
+        self.assertAlmostEqual(slept[0], 25, delta=2)
+
+    def test_a_garbage_retry_after_is_ignored(self):
+        _, slept = self._post(429, {"Retry-After": "soon-ish"}, attempts=2)
+        self.assertEqual(slept, [1.5])
